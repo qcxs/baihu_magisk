@@ -1,0 +1,41 @@
+# ============ Build output ============
+# 模块打包产物
+dist/
+webui/dist/
+
+# ============ Node.js (前端依赖) ============
+webui/node_modules/
+webui/*.log
+npm-debug.log*
+
+# ============ 临时文件 ============
+# 临时脚本/诊断文件 (用 tmp/ 存放, 不入库)
+tmp/
+*.tmp
+*.bak
+*.orig
+*.patch
+
+# ============ IDE / Editor ============
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ============ OS ============
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+*.egg
+
+# ============ 日志 / 缓存 ============
+*.log
+logs/
+.cache/

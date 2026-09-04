@@ -1,0 +1,935 @@
+#!/system/bin/sh
+# Baihu Panel Control Script
+# Usage: baihu <command> [options]
+# Commands: init, pull, provision, start, stop, status, update,
+#           shell, password, resetpwd, ssh, log, version
+
+# BAIHU_SCRIPT_DIR is set by customize.sh when this file is sourced
+SCRIPT_DIR=${BAIHU_SCRIPT_DIR:-${0%/*}}
+MODDIR=${SCRIPT_DIR%/bin}
+
+# Prefer bundled commands (busybox applets + static tools) over host system ones:
+# modified ROMs may ship stripped or missing toybox binaries.
+case ":$PATH:" in
+  *":$SCRIPT_DIR:"*) ;;
+  *) PATH="$SCRIPT_DIR:$PATH"; export PATH ;;
+esac
+DATA_DIR=/data/baihu
+ROOTFS=$DATA_DIR/rootfs
+HOME_DIR=$DATA_DIR/home
+LAYERS_DIR=$DATA_DIR/layers
+CONFIG_FILE=$DATA_DIR/baihu.conf
+SECRET_FILE=$DATA_DIR/secret.key
+LOG_FILE=$DATA_DIR/run.log
+MANIFEST_FILE=$DATA_DIR/manifest.json
+CONFIG_BLOB=$DATA_DIR/config.json
+LAYER_LIST=$DATA_DIR/layers.txt
+
+# Default mirrors (ordered by priority)
+MIRROR_NJU="https://ghcr.nju.edu.cn"
+MIRROR_GHCR="https://ghcr.io"
+
+BAIHU_REPO="engigu/baihu"
+BAIHU_TAG="latest"
+BAIHU_ARCH=""
+
+# Load config
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# Auto-detect architecture - always override to match device hardware
+# Uses getprop ro.product.cpu.abi (reflects actual ABI) with uname -m fallback.
+# uname -m can report aarch64 on x86_64 devices through translation layers
+# (e.g. Houdini), but glibc-based rootfs binaries won't run in that case.
+detect_arch() {
+  local arch
+  if command -v getprop >/dev/null 2>&1; then
+    arch=$(getprop ro.product.cpu.abi 2>/dev/null)
+  fi
+  if [ -z "$arch" ]; then
+    arch=$(uname -m 2>/dev/null)
+  fi
+  case "$arch" in
+    aarch64|arm64|arm64-v8a) echo "arm64" ;;
+    x86_64|amd64)            echo "amd64" ;;
+    armv7l|armv8l|armeabi-v7a) echo "arm" ;;
+    i686|i386|x86)           echo "386" ;;
+    *)                       echo "amd64" ;;
+  esac
+}
+BAIHU_ARCH=$(detect_arch)
+
+# ============================================================
+# Utility Functions
+# ============================================================
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+ui_print() {
+  echo "$*"
+  log "$*"
+}
+
+abort() {
+  ui_print "! $*"
+  exit 1
+}
+
+env_type() {
+  if [ -n "$MAGISK_VER_CODE" ]; then
+    echo "magisk"
+  elif [ -n "$KSU" ]; then
+    echo "ksu"
+  elif [ -n "$APATCH" ]; then
+    echo "apatch"
+  else
+    echo "unknown"
+  fi
+}
+
+volume_key() {
+  local prompt="$1"
+  local default=${2:-0}
+  ui_print "$prompt"
+  ui_print "  音量+ = 确认, 音量- = 取消 (5秒超时自动继续)"
+  if type choose 2>/dev/null | grep -q 'function'; then
+    choose "$prompt" 2>/dev/null && return 0 || return 1
+  fi
+  # Fallback: use default
+  ui_print "  [无法检测音量键, 自动继续]"
+  return $default
+}
+
+set_perm() {
+  local file="$1" mode="$2" owner="$3" group="$4"
+  chown "$owner:$group" "$file" 2>/dev/null || true
+  chmod "$mode" "$file" 2>/dev/null || true
+}
+
+need_bin() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    local fallback="$SCRIPT_DIR/$cmd"
+    if [ -f "$fallback" ]; then
+      export PATH="$SCRIPT_DIR:$PATH"
+    else
+      abort "缺少依赖: $cmd"
+    fi
+  fi
+}
+
+# Panel generates the admin password on first boot and prints it to its stdout,
+# which cmd_start / service.sh redirect into run.log. Extract it from there.
+# The password is always on the 3rd [Init] line (line 3 of grep output).
+get_admin_password() {
+  [ -f "$LOG_FILE" ] || return 0
+  grep -a '\[Init\]' "$LOG_FILE" 2>/dev/null | tr -d '\033' | head -3 | tail -1 \
+    | tr ':' '\n' | tail -1 | tr -cd 'A-Za-z0-9'
+}
+
+# Panel process(es) as reported by pidof; the wrapper shell that runs
+# "baihu start" is a different PID and must not be tracked instead.
+panel_pids() {
+  pidof baihu 2>/dev/null
+}
+
+# Process age, read from /proc: modified ROMs may ship no usable ps applet.
+proc_uptime() {
+  local pid="$1" start upt secs d h m
+  start=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)
+  upt=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+  [ -n "$start" ] && [ -n "$upt" ] || { echo "unknown"; return 0; }
+  # starttime is expressed in clock ticks, USER_HZ is 100 on Android
+  secs=$(( ${upt%.*} - start / 100 ))
+  [ "$secs" -gt 0 ] 2>/dev/null || secs=0
+  d=$((secs / 86400)); h=$(((secs % 86400) / 3600)); m=$(((secs % 3600) / 60))
+  if [ "$d" -gt 0 ]; then
+    echo "${d}d ${h}h ${m}m"
+  else
+    echo "${h}h ${m}m"
+  fi
+}
+
+proc_rss() {
+  local pid="$1" kb
+  kb=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+  [ -n "$kb" ] || { echo "unknown"; return 0; }
+  awk "BEGIN {printf \"%.1fMB\", $kb / 1024}"
+}
+
+# ============================================================
+# OCI Download Functions
+# ============================================================
+
+fetch_token() {
+  local url="$1"
+  local response
+  response=$(curl -sS -L "$url" 2>/dev/null)
+  echo "$response" | jq -r '.token // .access_token // empty' 2>/dev/null
+}
+
+# curl wrapper with optional bearer token.
+# NOTE: never build "-H Authorization: Bearer $token" into an unquoted string:
+# shell word-splitting turns "Bearer"/token into extra URLs (curl: Could not
+# resolve host: Bearer) and ghcr.io then answers 401.
+curl_get() {
+  local url="$1" out="$2" auth="$3"
+  shift 3
+  if [ -n "$auth" ]; then
+    curl -sS -L --fail -o "$out" "$@" -H "Authorization: Bearer $auth" "$url" 2>/dev/null
+  else
+    curl -sS -L --fail -o "$out" "$@" "$url" 2>/dev/null
+  fi
+}
+
+fetch_url() {
+  local url="$1" out="$2" auth="$3"
+  # Try with resume first
+  if [ -f "$out" ] && [ "$(stat -c%s "$out" 2>/dev/null || echo 0)" -gt 0 ]; then
+    curl_get "$url" "$out" "$auth" -C - && return 0
+  fi
+  curl_get "$url" "$out" "$auth" && return 0
+  return 1
+}
+
+pull_manifest() {
+  local mirror="$1" token="$2" arch="$3"
+  local tmp_dir="$DATA_DIR/.tmp"
+  local index_file="$tmp_dir/index.json"
+  local arch_file="$tmp_dir/arch.json"
+
+  mkdir -p "$tmp_dir"
+
+  # Fetch index manifest (both Accept headers required: the image is published
+  # as an OCI index, a Docker-only Accept gets MANIFEST_UNKNOWN)
+  ui_print "  获取镜像索引..."
+  local index_url="$mirror/v2/$BAIHU_REPO/manifests/$BAIHU_TAG"
+  curl_get "$index_url" "$index_file" "$token" \
+    -H "Accept: application/vnd.oci.image.index.v1+json" \
+    -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" || return 1
+
+  # Check if it's an index or direct manifest
+  local media_type
+  media_type=$(jq -r '.mediaType // empty' "$index_file" 2>/dev/null)
+
+  if echo "$media_type" | grep -qi "index\|list" 2>/dev/null || jq -e '.manifests' "$index_file" >/dev/null 2>&1; then
+    # Find the matching arch manifest digest
+    local arch_digest
+    arch_digest=$(jq -r ".manifests[] | select(.platform.architecture == \"$arch\") | .digest" "$index_file" 2>/dev/null | head -1)
+    [ -z "$arch_digest" ] && return 1
+
+    # Fetch the arch-specific manifest
+    ui_print "  获取架构清单 ($arch)..."
+    curl_get "$mirror/v2/$BAIHU_REPO/manifests/$arch_digest" "$arch_file" "$token" \
+      -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+      -H "Accept: application/vnd.docker.distribution.manifest.v2+json" || return 1
+    cp "$arch_file" "$MANIFEST_FILE"
+  else
+    cp "$index_file" "$MANIFEST_FILE"
+  fi
+
+  # Parse config and layers
+  local config_digest
+  config_digest=$(jq -r '.config.digest' "$MANIFEST_FILE" 2>/dev/null)
+  [ -z "$config_digest" ] && return 1
+
+  # Fetch config blob
+  ui_print "  获取配置..."
+  curl_get "$mirror/v2/$BAIHU_REPO/blobs/$config_digest" "$CONFIG_BLOB" "$token" || return 1
+
+  # Write layer list
+  jq -r '.layers[] | [.digest, .size, .mediaType] | @tsv' "$MANIFEST_FILE" > "$LAYER_LIST" 2>/dev/null
+  local layer_count
+  layer_count=$(wc -l < "$LAYER_LIST")
+  ui_print "  共 $layer_count 层"
+
+  # Save digest for upgrade detection
+  local total_digest
+  total_digest=$(jq -r '.layers[].digest' "$MANIFEST_FILE" 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
+  echo "IMAGE_DIGEST=$total_digest" > "$DATA_DIR/.image_digest"
+
+  return 0
+}
+
+download_layers() {
+  local mirror="$1" token="$2"
+  local total=0 success=0 fail=0
+  local line_num=0
+
+  mkdir -p "$LAYERS_DIR"
+
+  total=$(wc -l < "$LAYER_LIST")
+  ui_print "  开始下载 $total 层..."
+
+  while IFS=$'\t' read -r digest size media_type; do
+    line_num=$((line_num + 1))
+    local layer_name="layer-$(printf '%03d' $line_num)"
+    local layer_file="$LAYERS_DIR/$layer_name"
+    local sha_expected="${digest#sha256:}"
+
+    # Check if already downloaded and valid
+    if [ -f "$layer_file" ]; then
+      local file_size
+      file_size=$(stat -c%s "$layer_file" 2>/dev/null || echo 0)
+      if [ "$file_size" -eq "$size" ] 2>/dev/null; then
+        local file_sha
+        file_sha=$(sha256sum "$layer_file" 2>/dev/null | cut -d' ' -f1)
+        if [ "$file_sha" = "$sha_expected" ]; then
+          ui_print "  [$line_num/$total] $layer_name 已存在, 跳过"
+          success=$((success + 1))
+          continue
+        fi
+      fi
+    fi
+
+    ui_print "  [$line_num/$total] $layer_name ($(human_size $size))"
+    rm -f "$layer_file"
+
+    # Download with resume
+    local attempt=0 max_attempt=3
+    local ok=0
+    while [ $attempt -lt $max_attempt ]; do
+      attempt=$((attempt + 1))
+      local layer_url="$mirror/v2/$BAIHU_REPO/blobs/$digest"
+
+      if [ -f "$layer_file" ] && [ "$(stat -c%s "$layer_file" 2>/dev/null || echo 0)" -gt 0 ]; then
+        # Resume
+        curl_get "$layer_url" "$layer_file" "$token" -C -
+      else
+        curl_get "$layer_url" "$layer_file" "$token"
+      fi
+
+      local curl_rc=$?
+      if [ $curl_rc -eq 0 ]; then
+        # Verify SHA256
+        local file_sha
+        file_sha=$(sha256sum "$layer_file" 2>/dev/null | cut -d' ' -f1)
+        if [ "$file_sha" = "$sha_expected" ]; then
+          ok=1
+          break
+        fi
+        ui_print "    SHA256校验失败, 重新下载..."
+        rm -f "$layer_file"
+      elif [ $attempt -lt $max_attempt ]; then
+        ui_print "    下载失败 (rc=$curl_rc), 重试 $attempt/$max_attempt..."
+        sleep 2
+      fi
+    done
+
+    if [ $ok -eq 1 ]; then
+      success=$((success + 1))
+    else
+      fail=$((fail + 1))
+      ui_print "  ! $layer_name 下载失败"
+      volume_key "$layer_name 下载失败, 重试?" 0
+      if [ $? -eq 0 ]; then
+        line_num=$((line_num - 1))
+        continue
+      fi
+    fi
+  done < "$LAYER_LIST"
+
+  ui_print "  下载完成: $success 成功, $fail 失败"
+  [ $fail -gt 0 ] && return 1
+  return 0
+}
+
+human_size() {
+  local bytes=$1
+  if [ $bytes -ge 1048576 ]; then
+    echo "$((bytes / 1048576))MB"
+  elif [ $bytes -ge 1024 ]; then
+    echo "$((bytes / 1024))KB"
+  else
+    echo "${bytes}B"
+  fi
+}
+
+# ============================================================
+# Rootfs Extraction
+# ============================================================
+
+# Marker recording which arch+image-digest a rootfs dir was extracted for.
+# Stored next to (not inside) the rootfs so it survives rootfs re-creation.
+rootfs_meta() {
+  echo "$(dirname "${ROOTFS%/}")/.rootfs.meta"
+}
+
+extract_rootfs() {
+  local meta new_digest
+  meta=$(rootfs_meta)
+  new_digest=$(cut -d= -f2 "$DATA_DIR/.image_digest" 2>/dev/null)
+
+  # Skip only when files exist AND marker matches current arch + digest
+  # (existence alone would keep a stale rootfs of the wrong architecture)
+  if [ -f "$ROOTFS/app/baihu" ] && [ -f "$ROOTFS/app/docker-entrypoint.sh" ] \
+    && [ -f "$meta" ] \
+    && grep -qx "ARCH=$BAIHU_ARCH" "$meta" \
+    && grep -qx "DIGEST=$new_digest" "$meta"; then
+    local old_size
+    old_size=$(du -sh "$ROOTFS" 2>/dev/null | cut -f1)
+    ui_print "    rootfs 已是当前版本 ($old_size), 跳过解包"
+    return 0
+  fi
+
+  # Stale or incomplete rootfs: clean up for fresh extract
+  if [ -d "$ROOTFS" ]; then
+    ui_print "    rootfs 缺失或版本不匹配, 清理后重新解包..."
+    rm -rf "$ROOTFS" 2>/dev/null || true
+  fi
+
+  ui_print "  解包 rootfs..."
+  mkdir -p "$ROOTFS"
+
+  local total=0
+  total=$(ls "$LAYERS_DIR"/layer-* 2>/dev/null | wc -l)
+  if [ "$total" -eq 0 ]; then
+    ui_print "    找不到层文件"
+    return 1
+  fi
+
+  local count=0
+  for layer in $(ls "$LAYERS_DIR"/layer-* 2>/dev/null | sort); do
+    count=$((count + 1))
+    local name
+    name=$(basename "$layer")
+    ui_print "    [$count/$total] $name"
+    # Use gzip -dc | tar -xf to avoid relying on any single binary's gzip support
+    if ! gzip -dc "$layer" 2>/dev/null | tar -xpf - -C "$ROOTFS" 2>/dev/null; then
+      # Fallback: try tar -zpxf directly
+      if ! tar -zpxf "$layer" -C "$ROOTFS" 2>/dev/null; then
+        ui_print "    解包失败: $name"
+        return 1
+      fi
+    fi
+  done
+
+  # Verify
+  if [ -f "$ROOTFS/app/baihu" ] && [ -f "$ROOTFS/app/docker-entrypoint.sh" ]; then
+    printf 'ARCH=%s\nDIGEST=%s\n' "$BAIHU_ARCH" "$new_digest" > "$meta" 2>/dev/null || true
+    ui_print "    解包完成, rootfs=$(du -sh "$ROOTFS" 2>/dev/null | cut -f1)"
+  else
+    ui_print "    解包失败: 缺少关键文件"
+    ls "$ROOTFS/app/" 2>/dev/null | head -20
+    return 1
+  fi
+}
+
+# ============================================================
+# Container Management
+# ============================================================
+
+ruri_run() {
+  export ruri_rexec=1
+  local ruri_bin="$SCRIPT_DIR/ruri"
+  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
+
+  # Check if namespaces are available
+  local ns_flags=""
+  if "$ruri_bin" -p "$ROOTFS" /bin/true 2>/dev/null; then
+    ns_flags="-p -S -A"
+  else
+    ns_flags="-f"
+  fi
+
+  # Full path from container ENV
+  local BAIHU_PATH="/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  "$ruri_bin" $ns_flags \
+    -W /app \
+    -m "$HOME_DIR/data" /app/data \
+    -m "$HOME_DIR/configs" /app/configs \
+    -m "$HOME_DIR/envs" /app/envs \
+    -e "PATH" "$BAIHU_PATH" \
+    -e "HOME" "/root" \
+    -e "TZ" "${TZ:-Asia/Shanghai}" \
+    -e "LANG" "C.UTF-8" \
+    -e "LC_ALL" "C.UTF-8" \
+    -e "MISE_DATA_DIR" "/app/envs/mise" \
+    -e "MISE_CONFIG_DIR" "/app/envs/mise" \
+    -e "MISE_TRUSTED_CONFIG_PATHS" "/app/data/scripts" \
+    -e "BAIHU_SECRET_KEY" "$(cat "$SECRET_FILE" 2>/dev/null)" \
+    "$ROOTFS" ./docker-entrypoint.sh
+}
+
+# ============================================================
+# Commands
+# ============================================================
+
+cmd_init() {
+  ui_print "初始化 /data/baihu/ 目录..."
+  mkdir -p "$DATA_DIR" "$HOME_DIR/data" "$HOME_DIR/configs" "$HOME_DIR/envs" \
+    "$LAYERS_DIR" "$DATA_DIR/.tmp"
+
+  # Generate secret key if not exists
+  if [ ! -f "$SECRET_FILE" ]; then
+    local secret
+    secret=$(tr -dc 'A-Za-z0-9!@#$%^&*()_+' < /dev/urandom 2>/dev/null | head -c 32)
+    echo -n "$secret" > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+    ui_print "  已生成密钥: $secret"
+  fi
+
+  # Write default config
+  local default_arch
+  default_arch=$(detect_arch)
+  cat > "$CONFIG_FILE" << CONFEOF
+# Baihu Panel Configuration
+# This file is sourced by the baihu control script
+
+# Mirror source (first available is used)
+MIRROR_1="https://ghcr.nju.edu.cn"
+MIRROR_2="https://ghcr.io"
+
+# Repository
+BAIHU_REPO="engigu/baihu"
+BAIHU_TAG="latest"
+BAIHU_ARCH="$default_arch"
+
+# Container settings
+TZ="Asia/Shanghai"
+CONFEOF
+
+  set_perm "$CONFIG_FILE" 644 0 0
+  ui_print "  配置文件: $CONFIG_FILE"
+  ui_print "初始化完成"
+}
+
+cmd_pull() {
+  need_bin curl
+  need_bin jq
+
+  ui_print "拉取白虎镜像..."
+  ui_print "  仓库: $BAIHU_REPO:$BAIHU_TAG"
+  ui_print "  架构: $BAIHU_ARCH"
+
+  local mirror_list=""
+  if [ -n "$MIRROR" ]; then
+    # Single mirror from env/config
+    mirror_list="$MIRROR"
+  else
+    mirror_list="${MIRROR_1:-$MIRROR_NJU} ${MIRROR_2:-$MIRROR_GHCR}"
+  fi
+
+  local token=""
+  local ok=0
+  for mirror in $mirror_list; do
+    ui_print "  尝试源: $mirror"
+
+    # Get token from official ghcr.io
+    if echo "$mirror" | grep -q "ghcr.io$" && [ -z "$token" ]; then
+      ui_print "    获取认证token..."
+      token=$(fetch_token "https://ghcr.io/token?scope=repository:$BAIHU_REPO:pull&service=ghcr.io")
+      if [ -n "$token" ]; then
+        ui_print "    认证成功"
+      else
+        ui_print "    认证失败, 尝试匿名访问"
+      fi
+    fi
+
+    # Fetch manifest
+    if pull_manifest "$mirror" "$token" "$BAIHU_ARCH"; then
+      ok=1
+      break
+    fi
+    ui_print "  源不可用, 切换下一个..."
+  done
+
+  [ $ok -eq 0 ] && ui_print "所有镜像源均不可用, 请检查网络" && return 1
+
+  # Download layers
+  local dl_ok=0
+  for mirror in $mirror_list; do
+    if download_layers "$mirror" "$token"; then
+      dl_ok=1
+      break
+    fi
+    ui_print "  切换下载源..."
+  done
+
+  [ $dl_ok -eq 0 ] && ui_print "层下载失败" && return 1
+
+  # Extract rootfs
+  extract_rootfs
+
+  ui_print "拉取完成"
+}
+
+cmd_provision() {
+  ui_print "配置白虎面板..."
+
+  # Ensure home directories have data
+  local src_data="$ROOTFS/app/data"
+  local src_envs="$ROOTFS/app/envs"
+  local src_configs="$ROOTFS/app/configs"
+
+  # Copy example data if home dirs are empty
+  if [ -d "$src_data" ] && [ -z "$(ls -A "$HOME_DIR/data" 2>/dev/null)" ]; then
+    cp -r "$src_data"/* "$HOME_DIR/data/" 2>/dev/null || true
+  fi
+  if [ -d "$src_envs" ] && [ -z "$(ls -A "$HOME_DIR/envs" 2>/dev/null)" ]; then
+    cp -r "$src_envs"/* "$HOME_DIR/envs/" 2>/dev/null || true
+  fi
+  if [ -d "$src_configs" ] && [ -z "$(ls -A "$HOME_DIR/configs" 2>/dev/null)" ]; then
+    cp -r "$src_configs"/* "$HOME_DIR/configs/" 2>/dev/null || true
+  fi
+
+  # Write resolv.conf
+  echo "nameserver 223.5.5.5" > "$ROOTFS/etc/resolv.conf" 2>/dev/null || true
+  echo "nameserver 114.114.114.114" >> "$ROOTFS/etc/resolv.conf" 2>/dev/null || true
+
+  set_perm "$ROOTFS/etc/resolv.conf" 644 0 0
+
+  ui_print "配置完成"
+}
+
+cmd_start() {
+  need_bin rurima
+  need_bin curl
+
+  # Check if already running
+  local pid
+  pid=$(panel_pids)
+  if [ -n "$pid" ]; then
+    ui_print "白虎面板已在运行 (PID: $pid)"
+    return 0
+  fi
+
+  # Check prerequisites
+  if [ ! -f "$ROOTFS/app/baihu" ] || [ ! -f "$ROOTFS/app/docker-entrypoint.sh" ]; then
+    abort "rootfs 不完整, 请先执行 baihu pull"
+  fi
+  if [ ! -f "$SECRET_FILE" ]; then
+    abort "缺少密钥, 请先执行 baihu init"
+  fi
+
+  ui_print "启动白虎面板容器..."
+
+  # run.log holds the auto-generated admin password: keep it root-only
+  touch "$LOG_FILE" 2>/dev/null || true
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+
+  # Wait for network
+  local i=0
+  while [ $i -lt 30 ]; do
+    if curl -sS --max-time 2 http://connect.rom.miui.com/generate_204 >/dev/null 2>&1; then
+      break
+    fi
+    i=$((i + 1))
+    sleep 2
+  done
+
+  # Start container; capture panel stdout so the generated password lands in run.log
+  ruri_run >>"$LOG_FILE" 2>&1 &
+  local job=$!
+
+  # Wait for startup, then look up the panel process itself: $job is only the
+  # wrapper shell, and rurima execs into the container init under a new PID.
+  sleep 5
+  local pid
+  pid=$(panel_pids)
+  if [ -z "$pid" ] && kill -0 $job 2>/dev/null; then
+    sleep 5
+    pid=$(panel_pids)
+  fi
+
+  if [ -n "$pid" ]; then
+    echo "$pid" > "$DATA_DIR/container.pid"
+    ui_print "容器已启动 (PID: $pid)"
+    ui_print "面板地址: http://127.0.0.1:8052"
+    local pass
+    pass=$(get_admin_password)
+    if [ -n "$pass" ]; then
+      ui_print "管理员账号: admin"
+      ui_print "初始密码:   $pass"
+    else
+      ui_print "首次启动约需 1 分钟, 之后执行 baihu password 查看初始密码"
+    fi
+  else
+    abort "容器启动失败, 查看日志: baihu log"
+  fi
+}
+
+cmd_stop() {
+  need_bin rurima
+  ui_print "停止白虎面板..."
+
+  # Kill container process (pidof may list more than one PID)
+  local pid
+  pid=$(panel_pids)
+  if [ -z "$pid" ] && [ -f "$DATA_DIR/container.pid" ]; then
+    pid=$(cat "$DATA_DIR/container.pid" 2>/dev/null)
+  fi
+  if [ -n "$pid" ]; then
+    kill $pid 2>/dev/null
+    sleep 2
+    kill -9 $pid 2>/dev/null
+    ui_print "  已停止进程 (PID: $pid)"
+  fi
+
+  # Umount rootfs
+  export ruri_rexec=1
+  local ruri_bin="$SCRIPT_DIR/ruri"
+  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
+  "$ruri_bin" -U "$ROOTFS" 2>/dev/null || true
+
+  rm -f "$DATA_DIR/container.pid"
+  ui_print "已停止"
+}
+
+cmd_status() {
+  local pid
+  pid=$(panel_pids)
+
+  echo "白虎面板状态"
+  echo "===================="
+  if [ -n "$pid" ]; then
+    local first=${pid%% *}
+    echo "  运行状态: 运行中 (PID: $pid)"
+    echo "  运行时间: $(proc_uptime "$first")"
+    echo "  内存占用: $(proc_rss "$first")"
+  else
+    echo "  运行状态: 已停止"
+  fi
+  echo "  rootfs: $(du -sh "$ROOTFS" 2>/dev/null | cut -f1)"
+  echo "  数据目录: $(du -sh "$HOME_DIR" 2>/dev/null | cut -f1)"
+  echo "  配置文件: $CONFIG_FILE"
+  echo "  日志文件: $LOG_FILE"
+
+  # Check port (ss preferred, fallback to netstat)
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlnp 2>/dev/null | grep -q :8052 && echo "  端口 8052: 监听中"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tlnp 2>/dev/null | grep -q :8052 && echo "  端口 8052: 监听中"
+  fi
+  echo "===================="
+}
+
+cmd_update() {
+  ui_print "更新白虎镜像..."
+
+  # Save current digest
+  local old_digest=""
+  [ -f "$DATA_DIR/.image_digest" ] && old_digest=$(cat "$DATA_DIR/.image_digest")
+
+  # Stop container
+  cmd_stop
+
+  # Re-pull
+  cmd_pull
+
+  # Check if digest changed
+  local new_digest=""
+  [ -f "$DATA_DIR/.image_digest" ] && new_digest=$(cat "$DATA_DIR/.image_digest")
+
+  if [ "$old_digest" = "$new_digest" ] && [ -n "$old_digest" ]; then
+    ui_print "镜像无变化, 跳过更新"
+  else
+    ui_print "镜像已更新"
+    # Re-provision (keeps home data)
+    cmd_provision
+  fi
+
+  # Restart
+  cmd_start
+}
+
+cmd_shell() {
+  if [ ! -d "$ROOTFS" ]; then
+    abort "rootfs 不存在"
+  fi
+  export ruri_rexec=1
+  local ruri_bin="$SCRIPT_DIR/ruri"
+  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
+  local ns_flags=""
+  "$ruri_bin" -p "$ROOTFS" /bin/true 2>/dev/null && ns_flags="-p -S -A" || ns_flags="-f"
+  local BAIHU_PATH="/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  exec "$ruri_bin" $ns_flags \
+    -W /app \
+    -e "PATH" "$BAIHU_PATH" \
+    -e "HOME" "/root" \
+    -e "LANG" "C.UTF-8" \
+    -e "LC_ALL" "C.UTF-8" \
+    -e "MISE_DATA_DIR" "/app/envs/mise" \
+    -e "MISE_CONFIG_DIR" "/app/envs/mise" \
+    -e "TERM" "xterm-256color" \
+    "$ROOTFS" /bin/sh -l
+}
+
+cmd_log() {
+  if [ ! -f "$LOG_FILE" ]; then
+    echo "日志文件不存在"
+    return 1
+  fi
+  if [ "$1" = "-f" ] || [ "$1" = "--follow" ]; then
+    shift
+    tail -f "$LOG_FILE" 2>/dev/null || true
+  else
+    tail -n "${1:-50}" "$LOG_FILE" 2>/dev/null
+  fi
+}
+
+cmd_version() {
+  echo "白虎面板 Magisk 模块"
+  echo "  版本: $(grep 'version=' "$MODDIR/module.prop" 2>/dev/null | cut -d= -f2 || echo 'unknown')"
+  echo "  模块路径: $MODDIR"
+  echo "  数据路径: $DATA_DIR"
+  local ruri_bin="$SCRIPT_DIR/ruri"
+  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
+  # rurima --version opens with a banner whose first line is empty; the real
+  # value lives on the "rurima version ............: 0.9.2" line.
+  local ruri_ver
+  ruri_ver=$("$ruri_bin" --version 2>/dev/null | awk -F: '/version/ {gsub(/[ \t]/, "", $NF); print $NF; exit}')
+  [ -n "$ruri_ver" ] || ruri_ver="unknown"
+  echo "  ruri: $ruri_ver"
+}
+
+cmd_password() {
+  local pass
+  pass=$(get_admin_password)
+  if [ -n "$pass" ]; then
+    echo "管理员账号: admin"
+    echo "密    码: $pass"
+  else
+    echo "密码尚未生成, 请先启动面板 (baihu start)"
+    echo "首次启动约需 1 分钟生成密码"
+  fi
+}
+
+cmd_resetpwd() {
+  if [ ! -d "$ROOTFS" ]; then
+    abort "rootfs 不存在"
+  fi
+  export ruri_rexec=1
+  local ruri_bin="$SCRIPT_DIR/ruri"
+  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
+  local ns_flags=""
+  "$ruri_bin" -p "$ROOTFS" /bin/true 2>/dev/null && ns_flags="-p -S -A" || ns_flags="-f"
+  echo "正在进入密码重置界面..."
+  echo "用户名: admin"
+  echo "------------------------"
+  exec "$ruri_bin" $ns_flags \
+    -W /app \
+    -e "PATH" "/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    -e "HOME" "/root" \
+    "$ROOTFS" /app/baihu resetpwd admin
+}
+
+cmd_ssh() {
+  if [ ! -d "$ROOTFS" ]; then
+    abort "rootfs 不存在, 请先执行 baihu pull"
+  fi
+  export ruri_rexec=1
+  local ruri_bin="$SCRIPT_DIR/ruri"
+  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
+  local ns_flags=""
+  "$ruri_bin" -p "$ROOTFS" /bin/true 2>/dev/null && ns_flags="-p -S -A" || ns_flags="-f"
+  local BAIHU_PATH="/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  # Check if openssh-server is installed
+  ui_print "检查 SSH 服务..."
+  if ! "$ruri_bin" $ns_flags -W /app -e PATH "$BAIHU_PATH" -e HOME "/root" "$ROOTFS" \
+    /bin/sh -c "dpkg -l openssh-server 2>/dev/null | grep -q '^ii'" 2>/dev/null; then
+    ui_print "安装 openssh-server (首次需要, 约 1-2 分钟)..."
+    "$ruri_bin" $ns_flags -W /app -e PATH "$BAIHU_PATH" -e HOME "/root" "$ROOTFS" \
+      /bin/sh -c "apt-get update -qq 2>/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server 2>/dev/null" || {
+      ui_print "SSH 安装失败, 请检查网络连接后重试"
+      return 1
+    }
+    ui_print "SSH 安装完成"
+  fi
+
+  # Configure sshd: port 8022, root login, password auth
+  ui_print "配置 SSH 服务..."
+  "$ruri_bin" $ns_flags -W /app -e PATH "$BAIHU_PATH" -e HOME "/root" "$ROOTFS" \
+    /bin/sh -c "
+      sed -i 's/^#*Port.*/Port 8022/' /etc/ssh/sshd_config
+      sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+      mkdir -p /var/run/sshd
+      [ -f /etc/ssh/ssh_host_rsa_key ] || ssh-keygen -A 2>/dev/null
+    " 2>/dev/null
+
+  # Start sshd (-N skips .rurienv check, allows concurrent instance)
+  ui_print "启动 SSH 服务 (端口 8022)..."
+  "$ruri_bin" -N $ns_flags \
+    -e "HOME" "/root" \
+    "$ROOTFS" /usr/sbin/sshd -p 8022 2>/dev/null
+  sleep 1
+
+  # Get IP and show connection info
+  local ip=""
+  ip=$(busybox ip route get 1 2>/dev/null | grep -o 'src [0-9.]*' | cut -d' ' -f2)
+  [ -z "$ip" ] && ip=$(ifconfig 2>/dev/null | grep 'inet addr:192' | head -1 | cut -d: -f2 | cut -d' ' -f1)
+  [ -z "$ip" ] && ip=$(ip addr 2>/dev/null | grep 'inet 192' | head -1 | awk '{print $2}' | cut -d/ -f1)
+  [ -z "$ip" ] && ip="<device-ip>"
+
+  echo ""
+  echo "================================"
+  echo "SSH 连接信息"
+  echo "================================"
+  echo "  地址: ${ip}:8022"
+  echo "  用户: root"
+  echo "  密码: $(get_admin_password)"
+  echo ""
+  echo "  连接命令: ssh -p 8022 root@${ip}"
+  echo "  ADB 转发: adb forward tcp:8022 tcp:8022 && ssh -p 8022 root@127.0.0.1"
+  echo "================================"
+  echo ""
+  ui_print "SSH 服务已启动"
+}
+
+# ============================================================
+# Main
+# ============================================================
+
+# Sourced by the installer (customize.sh): expose the functions above and let
+# the caller handle everything else. Without this guard the usage text below
+# is printed in the middle of the install log.
+if [ -n "$BAIHU_SOURCED" ]; then
+  return 0 2>/dev/null || true
+fi
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  help|-h|--help)
+    cat <<'HELP'
+用法: baihu <命令> [选项]
+
+命令:
+  init       初始化 /data/baihu/ 目录和配置
+  pull       拉取白虎镜像并解包 rootfs
+  provision  配置面板环境
+  start      启动容器
+  stop       停止容器
+  status     查看运行状态
+  update     更新镜像 (stop + pull + provision + start)
+  shell      进入容器 shell
+  password   查看管理员初始密码
+  resetpwd   重置管理员密码 (交互式)
+  ssh        安装并启动 SSH 服务 (端口 8022)
+  log        查看日志 (默认50行, -f 持续跟踪)
+  version    显示版本信息
+HELP
+    ;;
+  init)      cmd_init "$@" ;;
+  pull)      cmd_pull "$@" ;;
+  provision) cmd_provision "$@" ;;
+  start)     cmd_start "$@" ;;
+  stop)      cmd_stop "$@" ;;
+  status)    cmd_status "$@" ;;
+  update)    cmd_update "$@" ;;
+  shell)     cmd_shell "$@" ;;
+  password)  cmd_password "$@" ;;
+  resetpwd)  cmd_resetpwd "$@" ;;
+  ssh)       cmd_ssh "$@" ;;
+  log)       cmd_log "$@" ;;
+  version)   cmd_version "$@" ;;
+  *)
+    echo "未知命令: $cmd"
+    echo "使用 baihu help 查看帮助"
+    ;;
+esac
