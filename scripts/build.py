@@ -28,6 +28,11 @@ BAIHU_MANIFEST = os.path.join(BAIHU_LIB_DIR, 'manifest.txt')
 
 EXCLUDE_IN_ZIP = {'.git', '__pycache__', '*.pyc', '.DS_Store'}
 
+# Default release version used for local/CI builds when no --version is given.
+# The tracked module.prop is kept at this value; --version overrides it with the
+# user-supplied release tag, and versionCode is always the git commit count.
+DEFAULT_VERSION = "1.0.0"
+
 def log(msg):
     print(f'  >> {msg}')
 
@@ -174,15 +179,37 @@ def install_on_device():
     log('Installing via ksud...')
     run('adb shell "su 0 /data/adb/ksu/bin/ksud module install /data/local/tmp/baihu_qcxs.zip 2>&1"')
 
+def git_commit_count():
+    """Return the number of commits reachable from HEAD.
+
+    versionCode tracks the git commit count so each release gets a larger,
+    monotonically increasing integer. Returns None when git is unavailable
+    (e.g. the repo was downloaded as a zip without .git), in which case the
+    caller keeps the existing versionCode fallback in module.prop.
+    """
+    try:
+        out = subprocess.run(
+            ['git', 'rev-list', '--count', 'HEAD'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True,
+        ).stdout.decode().strip()
+        return int(out)
+    except Exception:
+        return None
+
 def set_version(version):
-    """Update module/module.prop version and versionCode from a tag like 'v1.2.3'."""
+    """Write module/module.prop version and versionCode.
+
+    version: user release tag, e.g. 'v1.2.3' or '1.2.3' (the 'v' prefix is
+    normalized to 'vN.N.N').
+
+    versionCode is the git commit count, not something derived from the version
+    string, so it stays monotonic as development progresses. When git is not
+    available the existing versionCode line in module.prop is left untouched as
+    a fallback (relevant for local packaging of a plain repo zip).
+    """
     prop = os.path.join(MODULE_DIR, 'module.prop')
-    ver = version.lstrip('v')
-    # versionCode: derive integer from x.y.z -> x*10000+y*100+z (v1.2.3 -> 10203)
-    parts = [int(p) for p in ver.replace('-', '.').split('.')[:3]]
-    while len(parts) < 3:
-        parts.append(0)
-    code = parts[0] * 10000 + parts[1] * 100 + parts[2]
+    ver = version.lstrip('v').strip()
+    code = git_commit_count()
 
     text = open(prop, encoding='utf-8').read()
     lines = text.splitlines()
@@ -192,15 +219,21 @@ def set_version(version):
         if ln.startswith('version=') and not replaced['version']:
             out.append(f'version=v{ver}'); replaced['version'] = True
         elif ln.startswith('versionCode=') and not replaced['versionCode']:
-            out.append(f'versionCode={code}'); replaced['versionCode'] = True
+            replaced['versionCode'] = True
+            # Keep the fallback value unless we have a real commit count.
+            out.append(f'versionCode={code}' if code is not None else ln)
         else:
             out.append(ln)
     if not replaced['version']:
         out.append(f'version=v{ver}')
-    if not replaced['versionCode']:
+    if not replaced['versionCode'] and code is not None:
         out.append(f'versionCode={code}')
     open(prop, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
-    log(f'Set module version=v{ver} versionCode={code}')
+
+    if code is not None:
+        log(f'Set module version=v{ver} versionCode={code} (git commits)')
+    else:
+        log(f'Set module version=v{ver} (versionCode fallback kept)')
 
 def push_webui_to_device():
     """Push updated webroot directly to module dir (no reboot needed)."""
@@ -226,6 +259,12 @@ def main():
 
     if args.version:
         set_version(args.version)
+    elif not (args.push_webui or args.webui_only):
+        # Default/local packaging: unless --version is given, the module always
+        # ships the default release version (1.0.0). This keeps a plain local
+        # `python scripts/build.py` reproducible and independent of whatever
+        # version a previous --version run may have written into module.prop.
+        set_version(DEFAULT_VERSION)
 
     if args.push_webui:
         # Special fast path: rebuild webui and push live

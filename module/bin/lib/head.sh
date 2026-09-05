@@ -2,7 +2,7 @@
 # Baihu Panel Control Script
 # Usage: baihu <command> [options]
 # Commands: init, pull, provision, start, stop, status, update,
-#           shell, password, resetpwd, ssh, log, version
+#           shell, password, resetpwd, log, version
 #
 # NOTE: this is a source fragment. The module ships a single merged bin/baihu
 # that scripts/build.py produces by concatenating lib/*.sh in manifest.txt order.
@@ -31,9 +31,20 @@ CONFIG_BLOB=$DATA_DIR/config.json
 LAYER_LIST=$DATA_DIR/layers.txt
 ROOTFS_SIZE_FILE=$DATA_DIR/.rootfs.size
 
-# Default mirrors (ordered by priority)
-MIRROR_NJU="https://ghcr.nju.edu.cn"
-MIRROR_GHCR="https://ghcr.io"
+# Default mirror order and definitions (overridable in baihu.conf)
+# MIRROR_ORDER: space-separated list of mirror names, tried in order.
+# For each name, define MIRROR_<name>_URL and MIRROR_<name>_AUTH.
+# AUTH values: "none" (no token), "ghcr" (get token from ghcr.io).
+MIRROR_ORDER="nju official milu"
+
+MIRROR_nju_URL="https://ghcr.nju.edu.cn"
+MIRROR_nju_AUTH="none"
+
+MIRROR_official_URL="https://ghcr.io"
+MIRROR_official_AUTH="ghcr"
+
+MIRROR_milu_URL="https://ghcr.milu.moe"
+MIRROR_milu_AUTH="ghcr"
 
 # Android devices have no /etc/ssl/certs/ca-certificates.crt (and no
 # /etc/resolv.conf), so the bundled musl curl cannot validate TLS or resolve

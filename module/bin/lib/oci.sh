@@ -46,8 +46,8 @@ resolv_args() {
 }
 
 # curl wrapper with optional bearer token + DNS bypass + skip TLS verification.
-# -k: TLS verification is skipped on purpose (see note near MIRROR_NJU); image
-# integrity comes from the per-layer sha256 hash check, not the certificate.
+# -k: TLS verification is skipped on purpose (see note near the mirror config);
+# image integrity comes from the per-layer sha256 hash check, not the cert.
 # NOTE: never build "-H Authorization: Bearer $token" into an unquoted string:
 # shell word-splitting turns "Bearer"/token into extra URLs (curl: Could not
 # resolve host: Bearer) and ghcr.io then answers 401.
@@ -159,9 +159,10 @@ download_layers() {
     ui_print "  [$line_num/$total] $layer_name ($(human_size $size))"
     rm -f "$layer_file"
 
-    # Single download attempt: on a network failure the whole pull fails so the
-    # user can simply re-run `baihu pull`. No auto-retry loop here -- a broken
-    # mirror/connection just wastes time retrying.
+    # Single download attempt, then validate. If a layer fails we give up on
+    # this source immediately (the caller switches to the next mirror) rather
+    # than wasting time trying its remaining layers; already-downloaded layers
+    # are reused by hash when the next source retries.
     local layer_url="$mirror/v2/$BAIHU_REPO/blobs/$digest"
     curl_get "$layer_url" "$layer_file" "$token"
 
@@ -171,7 +172,8 @@ download_layers() {
       success=$((success + 1))
     else
       fail=$((fail + 1))
-      ui_print "  ! $layer_name 下载失败 (网络错误或校验失败), 请重试 baihu pull"
+      ui_print "  ! $layer_name 下载失败 (网络错误或校验失败), 尝试下一个源"
+      return 1
     fi
   done < "$LAYER_LIST"
 

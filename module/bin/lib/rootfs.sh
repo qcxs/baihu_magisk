@@ -23,6 +23,18 @@ extract_rootfs() {
   meta=$(rootfs_meta)
   new_digest=$(cut -d= -f2 "$DATA_DIR/.image_digest" 2>/dev/null)
 
+  # Install-time fast path: when pulling into a temp rootfs and the already
+  # deployed rootfs is the current arch+digest, there is nothing to extract.
+  # Avoids unpacking a whole ~1GB tree just to discard it. (baihu pull on a
+  # running system never sets BAIHU_REF_*, so the live path is unchanged.)
+  if [ -n "$BAIHU_REF_ROOTFS" ] && [ -f "$BAIHU_REF_ROOTFS/app/baihu" ] \
+    && [ -f "$BAIHU_REF_META" ] \
+    && grep -qx "ARCH=$BAIHU_ARCH" "$BAIHU_REF_META" \
+    && grep -qx "DIGEST=$new_digest" "$BAIHU_REF_META"; then
+    ui_print "    rootfs 已是当前版本, 跳过解包"
+    return 0
+  fi
+
   # Skip only when files exist AND marker matches current arch + digest
   # (existence alone would keep a stale rootfs of the wrong architecture)
   if [ -f "$ROOTFS/app/baihu" ] && [ -f "$ROOTFS/app/docker-entrypoint.sh" ] \

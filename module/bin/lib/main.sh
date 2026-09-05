@@ -27,7 +27,6 @@ print_help() {
   clean      删除镜像缓存并重装 (保留用户数据)
   password   查看管理员初始密码
   resetpwd   重置管理员密码 (交互式)
-  ssh        安装并启动 SSH 服务 (端口 8022)
   log        查看日志 (默认50行, -f 持续跟踪)
   version    显示版本信息
 HELP

@@ -25,7 +25,7 @@ ruri_flags() {
 }
 
 # Common ruri flags to enter/manage the container: working dir, container PATH
-# and HOME. Shared by shell/panel/resetpwd/ssh; callers append extra flags and
+# and HOME. Shared by shell/panel/resetpwd; callers append extra flags and
 # the command. Emitted as an unquoted string so it splices into a command line
 # exactly like $(ruri_flags).
 ruri_env() {

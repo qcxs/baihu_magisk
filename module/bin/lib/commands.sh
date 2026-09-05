@@ -22,10 +22,20 @@ cmd_init() {
 # Baihu Panel Configuration
 # This file is sourced by the baihu control script
 
-# Mirror source (first available is used)
-MIRROR_1="https://ghcr.nju.edu.cn"
-MIRROR_2="https://ghcr.io"
-MIRROR_3="https://ghcr.milu.moe"
+# Mirror configuration
+# MIRROR_ORDER: space-separated list of mirror names, tried in order.
+# For each name, define MIRROR_<name>_URL and MIRROR_<name>_AUTH.
+# AUTH values: "none" (no token needed), "ghcr" (get token from ghcr.io)
+MIRROR_ORDER="nju official milu"
+
+MIRROR_nju_URL="https://ghcr.nju.edu.cn"
+MIRROR_nju_AUTH="none"
+
+MIRROR_official_URL="https://ghcr.io"
+MIRROR_official_AUTH="ghcr"
+
+MIRROR_milu_URL="https://ghcr.milu.moe"
+MIRROR_milu_AUTH="ghcr"
 
 # Repository
 BAIHU_REPO="engigu/baihu"
@@ -50,6 +60,24 @@ CONFEOF
   ui_print "初始化完成"
 }
 
+# Resolve a mirror's URL and auth type by name.
+# Usage: mirror_resolve <name> <var_prefix>
+# Sets <var_prefix>_URL and <var_prefix>_AUTH in the caller's scope.
+mirror_resolve() {
+  local name="$1" prefix="$2"
+  eval "${prefix}_URL=\"\$MIRROR_${name}_URL\""
+  eval "${prefix}_AUTH=\"\$MIRROR_${name}_AUTH\""
+}
+
+# Get ghcr.io bearer token, cached so we only fetch once per pull.
+ghcr_token() {
+  local token_url="https://ghcr.io/token?scope=repository:$BAIHU_REPO:pull&service=ghcr.io"
+  if [ -z "$_GHCR_TOKEN" ]; then
+    _GHCR_TOKEN=$(fetch_token "$token_url")
+  fi
+  echo "$_GHCR_TOKEN"
+}
+
 cmd_pull() {
   need_bin curl
   need_bin jq
@@ -58,23 +86,38 @@ cmd_pull() {
   ui_print "  仓库: $BAIHU_REPO:$BAIHU_TAG"
   ui_print "  架构: $BAIHU_ARCH"
 
-  local mirror_list=""
+  # Build mirror list: ordered by MIRROR_ORDER, each with URL + auth type.
+  # If MIRROR env is set, use it as a single URL (overrides everything).
+  local mirror_names=""
   if [ -n "$MIRROR" ]; then
-    # Single mirror from env/config
-    mirror_list="$MIRROR"
+    # Single URL override — wrap it as a nameless entry
+    mirror_names="__override"
+    MIRROR___override_URL="$MIRROR"
+    MIRROR___override_AUTH="ghcr"
   else
-    mirror_list="${MIRROR_1:-$MIRROR_NJU} ${MIRROR_2:-$MIRROR_GHCR}"
+    mirror_names="$MIRROR_ORDER"
   fi
 
+  # A source is only accepted when BOTH its manifest and its layers download.
+  # Manifest + layers are pulled per source, so switching sources re-pulls the
+  # manifest too: a mirror may cache a different digest for the same tag, and
+  # reusing the previous source's layer list would make every sha256 check fail.
   local token=""
   local ok=0
-  for mirror in $mirror_list; do
-    ui_print "  尝试源: $mirror"
+  for name in $mirror_names; do
+    local url="" auth=""
+    mirror_resolve "$name" "M"
+    url="$M_URL"
+    auth="$M_AUTH"
 
-    # Get token from official ghcr.io
-    if echo "$mirror" | grep -q "ghcr.io$" && [ -z "$token" ]; then
+    [ -z "$url" ] && continue
+
+    ui_print "  尝试源: $name ($url)"
+
+    # Get token if auth type requires it (ghcr_token caches, so we fetch once)
+    if [ "$auth" = "ghcr" ] && [ -z "$token" ]; then
       ui_print "    获取认证token..."
-      token=$(fetch_token "https://ghcr.io/token?scope=repository:$BAIHU_REPO:pull&service=ghcr.io")
+      token=$(ghcr_token)
       if [ -n "$token" ]; then
         ui_print "    认证成功"
       else
@@ -82,27 +125,19 @@ cmd_pull() {
       fi
     fi
 
-    # Fetch manifest
-    if pull_manifest "$mirror" "$token" "$BAIHU_ARCH"; then
-      ok=1
-      break
+    # Fetch manifest and layers for this source
+    if pull_manifest "$url" "$token" "$BAIHU_ARCH"; then
+      if download_layers "$url" "$token"; then
+        ok=1
+        break
+      fi
+      ui_print "  源层下载失败, 切换下一个..."
+    else
+      ui_print "  源不可用, 切换下一个..."
     fi
-    ui_print "  源不可用, 切换下一个..."
   done
 
-  [ $ok -eq 0 ] && ui_print "所有镜像源均不可用, 请检查网络" && return 1
-
-  # Download layers
-  local dl_ok=0
-  for mirror in $mirror_list; do
-    if download_layers "$mirror" "$token"; then
-      dl_ok=1
-      break
-    fi
-    ui_print "  切换下载源..."
-  done
-
-  [ $dl_ok -eq 0 ] && ui_print "层下载失败" && return 1
+  [ $ok -eq 0 ] && abort "所有镜像源均不可用, 请检查网络"
 
   # Extract rootfs
   extract_rootfs
@@ -302,7 +337,7 @@ cmd_shell() {
     -e "MISE_DATA_DIR" "/app/envs/mise" \
     -e "MISE_CONFIG_DIR" "/app/envs/mise" \
     -e "TERM" "xterm-256color" \
-    "$ROOTFS" /bin/sh -l
+    "$ROOTFS" /bin/bash -l "$@"
 }
 
 # Passthrough for official panel commands: baihu panel <cmd> [args...].
@@ -477,64 +512,4 @@ cmd_resetpwd() {
     "$ROOTFS" /app/baihu resetpwd admin
 }
 
-cmd_ssh() {
-  if [ ! -d "$ROOTFS" ]; then
-    abort "rootfs 不存在, 请先执行 baihu pull"
-  fi
-  export ruri_rexec=1
-  local ruri_bin_path ns_flags
-  ruri_bin_path=$(ruri_bin)
-  ns_flags=$(ruri_flags)
 
-  # Check if openssh-server is installed
-  ui_print "检查 SSH 服务..."
-  if ! "$ruri_bin_path" $ns_flags $(ruri_env) "$ROOTFS" \
-    /bin/sh -c "dpkg -l openssh-server 2>/dev/null | grep -q '^ii'" 2>/dev/null; then
-    ui_print "安装 openssh-server (首次需要, 约 1-2 分钟)..."
-    "$ruri_bin_path" $ns_flags $(ruri_env) "$ROOTFS" \
-      /bin/sh -c "apt-get update -qq 2>/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server 2>/dev/null" || {
-      ui_print "SSH 安装失败, 请检查网络连接后重试"
-      return 1
-    }
-    ui_print "SSH 安装完成"
-  fi
-
-  # Configure sshd: port 8022, root login, password auth
-  ui_print "配置 SSH 服务..."
-  "$ruri_bin_path" $ns_flags $(ruri_env) "$ROOTFS" \
-    /bin/sh -c "
-      sed -i 's/^#*Port.*/Port 8022/' /etc/ssh/sshd_config
-      sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-      sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-      mkdir -p /var/run/sshd
-      [ -f /etc/ssh/ssh_host_rsa_key ] || ssh-keygen -A 2>/dev/null
-    " 2>/dev/null
-
-  # Start sshd (-N skips .rurienv check, allows concurrent instance)
-  ui_print "启动 SSH 服务 (端口 8022)..."
-  "$ruri_bin_path" -N $ns_flags \
-    -e "HOME" "/root" \
-    "$ROOTFS" /usr/sbin/sshd -p 8022 2>/dev/null
-  sleep 1
-
-  # Get IP and show connection info
-  local ip=""
-  ip=$(busybox ip route get 1 2>/dev/null | grep -o 'src [0-9.]*' | cut -d' ' -f2)
-  [ -z "$ip" ] && ip=$(ifconfig 2>/dev/null | grep 'inet addr:192' | head -1 | cut -d: -f2 | cut -d' ' -f1)
-  [ -z "$ip" ] && ip=$(ip addr 2>/dev/null | grep 'inet 192' | head -1 | awk '{print $2}' | cut -d/ -f1)
-  [ -z "$ip" ] && ip="<device-ip>"
-
-  echo ""
-  echo "================================"
-  echo "SSH 连接信息"
-  echo "================================"
-  echo "  地址: ${ip}:8022"
-  echo "  用户: root"
-  echo "  密码: $(get_admin_password)"
-  echo ""
-  echo "  连接命令: ssh -p 8022 root@${ip}"
-  echo "  ADB 转发: adb forward tcp:8022 tcp:8022 && ssh -p 8022 root@127.0.0.1"
-  echo "================================"
-  echo ""
-  ui_print "SSH 服务已启动"
-}

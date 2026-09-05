@@ -154,8 +154,18 @@ fi
 if [ ! -f "$DATA_DIR/baihu.conf" ]; then
   cat > "$DATA_DIR/baihu.conf" << CONFEOF
 # Baihu Panel Configuration
-MIRROR_1="https://ghcr.nju.edu.cn"
-MIRROR_2="https://ghcr.io"
+# Mirror configuration (order by priority)
+MIRROR_ORDER="nju official milu"
+
+MIRROR_nju_URL="https://ghcr.nju.edu.cn"
+MIRROR_nju_AUTH="none"
+
+MIRROR_official_URL="https://ghcr.io"
+MIRROR_official_AUTH="ghcr"
+
+MIRROR_milu_URL="https://ghcr.milu.moe"
+MIRROR_milu_AUTH="ghcr"
+
 BAIHU_REPO="engigu/baihu"
 BAIHU_TAG="latest"
 BAIHU_ARCH="$BAIHU_ARCH"
@@ -188,6 +198,11 @@ mkdir -p "$TMP_INSTALL/layers"
 LAYERS_DIR="$TMP_INSTALL/layers"
 ROOTFS="$TMP_INSTALL/rootfs"
 
+# Reference to the already-deployed rootfs+marker, so extract_rootfs can skip
+# unpacking into the temp dir when the current image is already deployed.
+BAIHU_REF_ROOTFS="$DATA_DIR/rootfs"
+BAIHU_REF_META="$DATA_DIR/.rootfs.meta"
+
 ui_print "- 检测网络..."
 # 5s timeout via ping, more reliable than curl on early-boot devices
 if ! ping -c 1 -W 5 www.baidu.com >/dev/null 2>&1; then
@@ -200,21 +215,27 @@ ui_print ""
 # Always fetch manifest and check layers; download_layers skips files with matching hash
 cmd_pull || abort "镜像拉取失败, 安装未完成"
 
-# Verify rootfs integrity (extract_rootfs skips if already complete)
+# Verify rootfs integrity. extract_rootfs may have skipped unpacking to the
+# temp dir because the deployed rootfs is already current — in that case the
+# temp dir is empty, so verify the deployed rootfs instead.
+VERIFY_ROOTFS="$ROOTFS"
+if [ ! -d "$ROOTFS" ]; then
+  VERIFY_ROOTFS="$BAIHU_REF_ROOTFS"
+fi
 ui_print "- 校验文件完整性..."
-if [ ! -f "$ROOTFS/app/baihu" ] || [ ! -f "$ROOTFS/app/docker-entrypoint.sh" ]; then
+if [ ! -f "$VERIFY_ROOTFS/app/baihu" ] || [ ! -f "$VERIFY_ROOTFS/app/docker-entrypoint.sh" ]; then
   abort "rootfs 校验失败: 缺少关键文件"
 fi
 
 # Verify rootfs with dynamic linker (more reliable than ruri -p on some devices)
 ui_print "- 校验 rootfs..."
-ld_path=$(find "$ROOTFS" -name 'ld-linux-*' -type f 2>/dev/null | head -1)
+ld_path=$(find "$VERIFY_ROOTFS" -name 'ld-linux-*' -type f 2>/dev/null | head -1)
 if [ -n "$ld_path" ]; then
-  lib_paths="$ROOTFS/lib/aarch64-linux-gnu:$ROOTFS/usr/lib/aarch64-linux-gnu"
+  lib_paths="$VERIFY_ROOTFS/lib/aarch64-linux-gnu:$VERIFY_ROOTFS/usr/lib/aarch64-linux-gnu"
   if [ "$BAIHU_ARCH" = "amd64" ]; then
-    lib_paths="$ROOTFS/lib/x86_64-linux-gnu:$ROOTFS/usr/lib/x86_64-linux-gnu"
+    lib_paths="$VERIFY_ROOTFS/lib/x86_64-linux-gnu:$VERIFY_ROOTFS/usr/lib/x86_64-linux-gnu"
   fi
-  if ! "$ld_path" --library-path "$lib_paths" "$ROOTFS/bin/true" 2>/dev/null; then
+  if ! "$ld_path" --library-path "$lib_paths" "$VERIFY_ROOTFS/bin/true" 2>/dev/null; then
     ui_print "  ! 动态链接器校验跳过 (非致命)"
   fi
 fi
@@ -230,8 +251,17 @@ sleep 1
 TMP_META="$TMP_INSTALL/.rootfs.meta"
 DATA_META="$DATA_DIR/.rootfs.meta"
 need_deploy=1
-if [ -f "$DATA_DIR/rootfs/app/baihu" ] && [ -f "$TMP_META" ] \
-  && cmp -s "$TMP_META" "$DATA_META"; then
+if [ -d "$TMP_INSTALL/rootfs" ] && [ -f "$TMP_META" ]; then
+  # extract_rootfs unpacked into the temp dir (new or changed image): compare
+  # arch+digest markers. Existence alone is not enough — after an architecture
+  # change (e.g. arm64 -> amd64) the old rootfs must be replaced.
+  if [ -f "$DATA_DIR/rootfs/app/baihu" ] && cmp -s "$TMP_META" "$DATA_META"; then
+    need_deploy=0
+    ui_print "- rootfs 已是当前版本, 跳过部署"
+  fi
+else
+  # extract_rootfs skipped because the deployed rootfs is already current,
+  # so there is nothing to deploy.
   need_deploy=0
   ui_print "- rootfs 已是当前版本, 跳过部署"
 fi
