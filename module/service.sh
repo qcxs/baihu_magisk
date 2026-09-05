@@ -49,16 +49,7 @@ fi
 echo "noSuspend" > /sys/power/wake_lock 2>/dev/null || true
 dumpsys deviceidle disable 2>/dev/null || true
 
-# Wait for network
-log "Waiting for network..."
-for i in $(seq 1 15); do
-  if curl -sS --max-time 2 http://connect.rom.miui.com/generate_204 >/dev/null 2>&1; then
-    log "Network ready"
-    break
-  fi
-  sleep 5
-done
-
+# 容器与宿主共享网络, 开机自启面板不依赖外网连通性, 无需等待网络.
 # Check if data exists
 if [ ! -f "$DATA_DIR/rootfs/app/baihu" ]; then
   log "rootfs not found, skipping autostart"

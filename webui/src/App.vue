@@ -20,6 +20,7 @@ const mem = ref('--')
 const rootfsSize = ref('--')
 const dataSize = ref('--')
 const portListening = ref(false)
+const panelPort = ref('18052')
 const password = ref('--')
 const logs = ref('')
 const logInfo = ref('')
@@ -29,30 +30,36 @@ let pollTimer = null
 async function refreshAll() {
   if (!hasBridge()) return
 
-  // status
-  try {
-    const r = await baihu.status()
-    const stdout = r.stdout || ''
-    containerRunning.value = stdout.includes('运行中') || stdout.includes('PID')
-    const m = s => { const x = stdout.match(s); return x ? x[1] : '--' }
-    pid.value     = m(/PID:\s*(\d+)/)
-    uptime.value  = m(/运行时间:\s*([\d\shmd]+)/)
-    mem.value     = m(/内存占用:\s*([\d.]+MB)/)
-    rootfsSize.value = m(/rootfs:\s*([\d.]+[KMG]?)/)
-    dataSize.value    = m(/数据目录:\s*([\d.]+[KMG]?)/)
-  } catch { containerRunning.value = false }
+  // Run independent queries in parallel (each resolves on failure, so a slow
+  // status check no longer stalls the rest). Port state and panel port come
+  // from `baihu status` (no separate scan needed).
+  const [s, pw] = await Promise.allSettled([
+    baihu.status(),
+    baihu.password(),
+  ])
 
-  // port
-  try {
-    const r = await baihu.portCheck()
-    const out = (r.stdout || '').trim()
-    portListening.value = out && !out.includes('not listening') && out.length > 0
-  } catch { portListening.value = false }
+  // status
+  if (s.status === 'fulfilled') {
+    const stdout = s.value.stdout || ''
+    containerRunning.value = stdout.includes('运行中') || stdout.includes('PID')
+    const get = re => { const mm = stdout.match(re); return mm ? mm[1] : '--' }
+    pid.value         = get(/PID:\s*(\d+)/)
+    uptime.value      = get(/运行时间:\s*([\d\shmd]+)/)
+    mem.value         = get(/内存占用:\s*([\d.]+MB)/)
+    rootfsSize.value  = get(/rootfs:\s*([\d.]+[KMG]?)/)
+    dataSize.value    = get(/数据目录:\s*([\d.]+[KMG]?)/)
+    portListening.value = stdout.includes('监听中')
+    const pm = stdout.match(/面板地址: http:\/\/[^:]+:(\d+)/)
+    if (pm) panelPort.value = pm[1]
+  } else {
+    containerRunning.value = false
+    pid.value = uptime.value = mem.value = rootfsSize.value = dataSize.value = '--'
+    portListening.value = false
+  }
 
   // password
-  try {
-    const r = await baihu.password()
-    const stdout = (r.stdout || '').trim()
+  if (pw.status === 'fulfilled') {
+    const stdout = (pw.value.stdout || '').trim()
     const lines = stdout.split('\n')
     let found = false
     for (const line of lines) {
@@ -60,7 +67,7 @@ async function refreshAll() {
       if (m) { password.value = m[0]; found = true; break }
     }
     if (!found) password.value = stdout.substring(0, 24) || '--'
-  } catch { /* ignore */ }
+  }
 }
 
 async function loadModuleVersion() {
@@ -138,13 +145,14 @@ onUnmounted(stopPoll)
       :uptime="uptime"
       :mem="mem"
       :port-listening="portListening"
+      :panel-port="panelPort"
       :rootfs-size="rootfsSize"
       :data-size="dataSize"
     />
 
     <PasswordCard :password="password" />
 
-    <ControlCard :container-running="containerRunning" @refresh="refreshAll" />
+    <ControlCard :container-running="containerRunning" :panel-port="panelPort" @refresh="refreshAll" />
 
     <LogCard :logs="logs" :log-info="logInfo" @load-log="loadLog" />
 

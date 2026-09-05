@@ -1,0 +1,77 @@
+name: Package & Release
+
+on:
+  # Manual trigger only
+  workflow_dispatch:
+    inputs:
+      version:
+        description: |
+          版本号 (如 v1.2.3)。
+          为空: 只打包并上传 artifact, 不发布 Release。
+          非空: 更新 module 版本号, 创建对应 tag 并发布 GitHub Release。
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: Build module zip
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 允许创建 tag / 发布 Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build & package
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            python scripts/build.py --version "${{ inputs.version }}"
+          else
+            python scripts/build.py
+          fi
+
+      - name: Upload zip (no release)
+        # 版本号为空: 仅作为 artifact 保留, 不发布
+        if: ${{ inputs.version == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: baihu_qcxs-module
+          path: dist/baihu_qcxs.zip
+          if-no-files-found: error
+
+      - name: Show release file info
+        if: ${{ inputs.version != '' }}
+        run: ls -lh dist/baihu_qcxs.zip
+
+      # 版本号非空: 创建 tag, 发布 GitHub Release 并附带 zip
+      - name: Create tag
+        if: ${{ inputs.version != '' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ inputs.version }}"
+          git push origin "${{ inputs.version }}"
+
+      - name: Create GitHub Release
+        if: ${{ inputs.version != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Release ${{ inputs.version }}
+          body: |
+            Baihu Panel (白虎面板) 模块发布。
+
+            版本: `${{ inputs.version }}`
+            - WebUI: Vue 3 + Vite
+            - 支持 Magisk / KernelSU / APatch
+            - KernelSU 需安装 Hybrid Mount 元模块
+          draft: false
+          prerelease: false
+          files: dist/baihu_qcxs.zip

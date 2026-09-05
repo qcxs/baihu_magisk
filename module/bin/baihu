@@ -3,6 +3,10 @@
 # Usage: baihu <command> [options]
 # Commands: init, pull, provision, start, stop, status, update,
 #           shell, password, resetpwd, ssh, log, version
+#
+# NOTE: this is a source fragment. The module ships a single merged bin/baihu
+# that scripts/build.py produces by concatenating lib/*.sh in manifest.txt order.
+# Edit the fragments here, not bin/baihu directly.
 
 # BAIHU_SCRIPT_DIR is set by customize.sh when this file is sourced
 SCRIPT_DIR=${BAIHU_SCRIPT_DIR:-${0%/*}}
@@ -21,21 +25,48 @@ LAYERS_DIR=$DATA_DIR/layers
 CONFIG_FILE=$DATA_DIR/baihu.conf
 SECRET_FILE=$DATA_DIR/secret.key
 LOG_FILE=$DATA_DIR/run.log
+PASSWORD_FILE=$DATA_DIR/.admin_password
 MANIFEST_FILE=$DATA_DIR/manifest.json
 CONFIG_BLOB=$DATA_DIR/config.json
 LAYER_LIST=$DATA_DIR/layers.txt
+ROOTFS_SIZE_FILE=$DATA_DIR/.rootfs.size
 
 # Default mirrors (ordered by priority)
 MIRROR_NJU="https://ghcr.nju.edu.cn"
 MIRROR_GHCR="https://ghcr.io"
 
+# Android devices have no /etc/ssl/certs/ca-certificates.crt (and no
+# /etc/resolv.conf), so the bundled musl curl cannot validate TLS or resolve
+# hostnames on its own. TLS verification is intentionally skipped (-k): image
+# integrity is guaranteed by the per-layer sha256 hash check in download_layers,
+# not by the transport certificate, so we don't need a bundled CA store nor risk
+# breakage when a mirror rotates/expires its certificate.
+
 BAIHU_REPO="engigu/baihu"
 BAIHU_TAG="latest"
 BAIHU_ARCH=""
 
+# Full PATH used inside the container (mise-based toolchain). Shared by launch
+# and by shell/panel/ssh/resetpwd so the value can't drift between call sites.
+BAIHU_PATH="/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 # Load config
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
+# Panel listening settings. Default: a high port bound to loopback only so the
+# panel is not exposed to the LAN/WAN. Override via PANEL_PORT / PANEL_HOST in
+# /data/baihu/baihu.conf; both are injected into the container as BH_SERVER_*.
+PANEL_PORT=${PANEL_PORT:-18052}
+PANEL_HOST=${PANEL_HOST:-127.0.0.1}
+
+# Log retention. run.log grows unbounded while the panel is up (module UI +
+# panel stdout both append to it), and there is no built-in rotation, so it can
+# fill the data partition over time. On every `baihu start` we rotate run.log
+# once it exceeds LOG_MAX_SIZE_MB and delete archives older than
+# LOG_RETENTION_DAYS. All three are configurable in baihu.conf.
+LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-3}
+LOG_MAX_SIZE_MB=${LOG_MAX_SIZE_MB:-20}
+LOG_MAX_ARCHIVES=${LOG_MAX_ARCHIVES:-5}
 # Auto-detect architecture - always override to match device hardware
 # Uses getprop ro.product.cpu.abi (reflects actual ABI) with uname -m fallback.
 # uname -m can report aarch64 on x86_64 devices through translation layers
@@ -76,31 +107,6 @@ abort() {
   exit 1
 }
 
-env_type() {
-  if [ -n "$MAGISK_VER_CODE" ]; then
-    echo "magisk"
-  elif [ -n "$KSU" ]; then
-    echo "ksu"
-  elif [ -n "$APATCH" ]; then
-    echo "apatch"
-  else
-    echo "unknown"
-  fi
-}
-
-volume_key() {
-  local prompt="$1"
-  local default=${2:-0}
-  ui_print "$prompt"
-  ui_print "  音量+ = 确认, 音量- = 取消 (5秒超时自动继续)"
-  if type choose 2>/dev/null | grep -q 'function'; then
-    choose "$prompt" 2>/dev/null && return 0 || return 1
-  fi
-  # Fallback: use default
-  ui_print "  [无法检测音量键, 自动继续]"
-  return $default
-}
-
 set_perm() {
   local file="$1" mode="$2" owner="$3" group="$4"
   chown "$owner:$group" "$file" 2>/dev/null || true
@@ -121,17 +127,45 @@ need_bin() {
 
 # Panel generates the admin password on first boot and prints it to its stdout,
 # which cmd_start / service.sh redirect into run.log. Extract it from there.
-# The password is always on the 3rd [Init] line (line 3 of grep output).
+# Because run.log is rotated/pruned (see run_log_maintenance), the password is
+# also persisted to PASSWORD_FILE so it survives rotation. The password is
+# always on the 3rd [Init] line (line 3 of grep output).
 get_admin_password() {
+  if [ -f "$PASSWORD_FILE" ]; then
+    local saved
+    saved=$(cat "$PASSWORD_FILE" 2>/dev/null | tr -cd 'A-Za-z0-9')
+    [ -n "$saved" ] && { echo "$saved"; return 0; }
+  fi
   [ -f "$LOG_FILE" ] || return 0
   grep -a '\[Init\]' "$LOG_FILE" 2>/dev/null | tr -d '\033' | head -3 | tail -1 \
     | tr ':' '\n' | tail -1 | tr -cd 'A-Za-z0-9'
 }
 
-# Panel process(es) as reported by pidof; the wrapper shell that runs
-# "baihu start" is a different PID and must not be tracked instead.
+# Persist the admin password once we've read it, so log rotation/pruning cannot
+# lose it. No-op if the panel has not generated one yet.
+save_admin_password() {
+  local pass
+  pass=$(get_admin_password)
+  [ -n "$pass" ] || return 0
+  printf '%s' "$pass" > "$PASSWORD_FILE" 2>/dev/null || true
+  chmod 600 "$PASSWORD_FILE" 2>/dev/null || true
+}
+
+# Panel process(es): the real baihu server binary. The wrapper shell that runs
+# "baihu start" and the ruri runner are different processes and must not match.
 panel_pids() {
-  pidof baihu 2>/dev/null
+  # Distinguish the real panel binary from the control script and the ruri
+  # runner. The panel runs as `baihu server` with its resolved executable being
+  # the container binary (basename "baihu"); the control script's EXE is a shell
+  # (/system/bin/sh) and the container runner is "rurima". Using pidof baihu
+  # would falsely match the control script's own process (comm=baihu), so match
+  # on the resolved /proc/<pid>/exe instead.
+  local p exe name
+  for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    exe=$(readlink "/proc/$p/exe" 2>/dev/null) || continue
+    name=$(basename "$exe" 2>/dev/null)
+    [ "$name" = "baihu" ] && echo "$p"
+  done
 }
 
 # Process age, read from /proc: modified ROMs may ship no usable ps applet.
@@ -157,7 +191,52 @@ proc_rss() {
   [ -n "$kb" ] || { echo "unknown"; return 0; }
   awk "BEGIN {printf \"%.1fMB\", $kb / 1024}"
 }
+# ============================================================
+# Log Maintenance
+# ============================================================
+# run.log has no built-in rotation and is appended to by both log()/ui_print()
+# and the panel's own stdout (ruri_run >> run.log), so it would grow without
+# bound. On every `baihu start` (before the panel launches) we:
+#   1. rotate run.log into run.log.1 ... run.log.N once it exceeds LOG_MAX_SIZE_MB
+#   2. delete run.log* archives older than LOG_RETENTION_DAYS
+# Rotation only happens while the panel is not running: once ruri_run holds
+# run.log open with `>>`, rotating the name would make the panel keep writing to
+# the renamed inode, so the active log must stay put during a session.
+run_log_maintenance() {
+  [ -d "$DATA_DIR" ] || return 0
 
+  # Prune expired archives first (safe to do at any time; the active run.log is
+  # being written so its mtime stays current and -mtime will not match it).
+  # Toybox find may lack -delete on older Android, so iterate and rm instead.
+  if [ "$LOG_RETENTION_DAYS" -gt 0 ] 2>/dev/null; then
+    find "$DATA_DIR" -maxdepth 1 -name 'run.log*' -type f \
+      -mtime +"$LOG_RETENTION_DAYS" 2>/dev/null | while read -r f; do
+        rm -f "$f" 2>/dev/null || true
+      done
+  fi
+
+  # Rotate the current log if it exceeds the size cap.
+  [ -f "$LOG_FILE" ] || return 0
+  [ "$LOG_MAX_SIZE_MB" -gt 0 ] 2>/dev/null || return 0
+  local size max_bytes i
+  size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+  max_bytes=$(( LOG_MAX_SIZE_MB * 1024 * 1024 ))
+  [ "$size" -le "$max_bytes" ] && return 0
+
+  # Shift archives .N -> .N+1, then move the current log to .1 and start fresh.
+  [ "$LOG_MAX_ARCHIVES" -gt 0 ] 2>/dev/null || LOG_MAX_ARCHIVES=5
+  i=$(( LOG_MAX_ARCHIVES - 1 ))
+  while [ "$i" -ge 1 ]; do
+    if [ -f "$LOG_FILE.$i" ]; then
+      mv -f "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))" 2>/dev/null || true
+    fi
+    i=$((i - 1))
+  done
+  mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+  : > "$LOG_FILE" 2>/dev/null || true
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  log "run.log 超过 ${LOG_MAX_SIZE_MB}MB, 已轮转 (最近 ${LOG_MAX_ARCHIVES} 份)"
+}
 # ============================================================
 # OCI Download Functions
 # ============================================================
@@ -165,32 +244,65 @@ proc_rss() {
 fetch_token() {
   local url="$1"
   local response
-  response=$(curl -sS -L "$url" 2>/dev/null)
+  local resolve_arg
+  resolve_arg=$(resolv_args "$url")
+  # shellcheck disable=SC2086
+  response=$(curl -sS -L $resolve_arg "$url" 2>/dev/null)
   echo "$response" | jq -r '.token // .access_token // empty' 2>/dev/null
 }
 
-# curl wrapper with optional bearer token.
+# Resolve a hostname to an IP using the system resolver (getprop/ping/getent).
+# Android has no /etc/resolv.conf, so the bundled musl curl cannot resolve DNS
+# on its own; using the OS resolver works identically on every device.
+resolve_host() {
+  local host="$1"
+  local ip=""
+  # getent may already return an IP (most reliable on running systems)
+  ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+  if [ -z "$ip" ]; then
+    ip=$(ping -c 1 -W 3 "$host" 2>/dev/null | grep -oE '\([0-9]+(\.[0-9]+){3}\)' | head -1 | tr -d '()')
+  fi
+  [ -n "$ip" ] && echo "$ip"
+}
+
+# Build curl --resolve argument(s) for every host used by a URL, so DNS is
+# resolved by the OS (works without /etc/resolv.conf). Output: space-separated
+# --resolve host:port:ip pairs, or empty if unresolved.
+resolv_args() {
+  local url="$1" hostport host port ip out=""
+  # strip scheme and path -> "host[:port]"
+  hostport=$(printf '%s' "$url" | sed 's#^[a-z]*://##; s#[/?#].*##')
+  # port = text after last colon if it's all digits, else 443
+  case "$hostport" in
+    *:[0-9]*) host="${hostport%:*}"; port="${hostport##*:}";;
+    *)        host="$hostport"; port=443;;
+  esac
+  ip=$(resolve_host "$host")
+  if [ -n "$ip" ]; then
+    out="--resolve $host:$port:$ip"
+  fi
+  echo "$out"
+}
+
+# curl wrapper with optional bearer token + DNS bypass + skip TLS verification.
+# -k: TLS verification is skipped on purpose (see note near MIRROR_NJU); image
+# integrity comes from the per-layer sha256 hash check, not the certificate.
 # NOTE: never build "-H Authorization: Bearer $token" into an unquoted string:
 # shell word-splitting turns "Bearer"/token into extra URLs (curl: Could not
 # resolve host: Bearer) and ghcr.io then answers 401.
 curl_get() {
   local url="$1" out="$2" auth="$3"
   shift 3
+  # resolve host via OS to bypass missing /etc/resolv.conf
+  local resolve_arg
+  resolve_arg=$(resolv_args "$url")
   if [ -n "$auth" ]; then
-    curl -sS -L --fail -o "$out" "$@" -H "Authorization: Bearer $auth" "$url" 2>/dev/null
+    # shellcheck disable=SC2086
+    curl -sS -L -k --fail $resolve_arg -o "$out" "$@" -H "Authorization: Bearer $auth" "$url" 2>/dev/null
   else
-    curl -sS -L --fail -o "$out" "$@" "$url" 2>/dev/null
+    # shellcheck disable=SC2086
+    curl -sS -L -k --fail $resolve_arg -o "$out" "$@" "$url" 2>/dev/null
   fi
-}
-
-fetch_url() {
-  local url="$1" out="$2" auth="$3"
-  # Try with resume first
-  if [ -f "$out" ] && [ "$(stat -c%s "$out" 2>/dev/null || echo 0)" -gt 0 ]; then
-    curl_get "$url" "$out" "$auth" -C - && return 0
-  fi
-  curl_get "$url" "$out" "$auth" && return 0
-  return 1
 }
 
 pull_manifest() {
@@ -286,47 +398,19 @@ download_layers() {
     ui_print "  [$line_num/$total] $layer_name ($(human_size $size))"
     rm -f "$layer_file"
 
-    # Download with resume
-    local attempt=0 max_attempt=3
-    local ok=0
-    while [ $attempt -lt $max_attempt ]; do
-      attempt=$((attempt + 1))
-      local layer_url="$mirror/v2/$BAIHU_REPO/blobs/$digest"
+    # Single download attempt: on a network failure the whole pull fails so the
+    # user can simply re-run `baihu pull`. No auto-retry loop here -- a broken
+    # mirror/connection just wastes time retrying.
+    local layer_url="$mirror/v2/$BAIHU_REPO/blobs/$digest"
+    curl_get "$layer_url" "$layer_file" "$token"
 
-      if [ -f "$layer_file" ] && [ "$(stat -c%s "$layer_file" 2>/dev/null || echo 0)" -gt 0 ]; then
-        # Resume
-        curl_get "$layer_url" "$layer_file" "$token" -C -
-      else
-        curl_get "$layer_url" "$layer_file" "$token"
-      fi
-
-      local curl_rc=$?
-      if [ $curl_rc -eq 0 ]; then
-        # Verify SHA256
-        local file_sha
-        file_sha=$(sha256sum "$layer_file" 2>/dev/null | cut -d' ' -f1)
-        if [ "$file_sha" = "$sha_expected" ]; then
-          ok=1
-          break
-        fi
-        ui_print "    SHA256校验失败, 重新下载..."
-        rm -f "$layer_file"
-      elif [ $attempt -lt $max_attempt ]; then
-        ui_print "    下载失败 (rc=$curl_rc), 重试 $attempt/$max_attempt..."
-        sleep 2
-      fi
-    done
-
-    if [ $ok -eq 1 ]; then
+    local file_sha
+    file_sha=$(sha256sum "$layer_file" 2>/dev/null | cut -d' ' -f1)
+    if [ "$file_sha" = "$sha_expected" ]; then
       success=$((success + 1))
     else
       fail=$((fail + 1))
-      ui_print "  ! $layer_name 下载失败"
-      volume_key "$layer_name 下载失败, 重试?" 0
-      if [ $? -eq 0 ]; then
-        line_num=$((line_num - 1))
-        continue
-      fi
+      ui_print "  ! $layer_name 下载失败 (网络错误或校验失败), 请重试 baihu pull"
     fi
   done < "$LAYER_LIST"
 
@@ -345,7 +429,6 @@ human_size() {
     echo "${bytes}B"
   fi
 }
-
 # ============================================================
 # Rootfs Extraction
 # ============================================================
@@ -354,6 +437,16 @@ human_size() {
 # Stored next to (not inside) the rootfs so it survives rootfs re-creation.
 rootfs_meta() {
   echo "$(dirname "${ROOTFS%/}")/.rootfs.meta"
+}
+
+# rootfs is immutable after extraction (all writes go to the bind-mounted
+# HOME_DIR), so its size is constant. Cache it at extract time instead of
+# re-running du -sh (several seconds on a ~1GB tree) on every baihu status.
+rootfs_size() {
+  local s
+  s=$(cat "$ROOTFS_SIZE_FILE" 2>/dev/null | head -1)
+  [ -n "$s" ] && { echo "$s"; return 0; }
+  du -sh "$ROOTFS" 2>/dev/null | cut -f1
 }
 
 extract_rootfs() {
@@ -369,6 +462,7 @@ extract_rootfs() {
     && grep -qx "DIGEST=$new_digest" "$meta"; then
     local old_size
     old_size=$(du -sh "$ROOTFS" 2>/dev/null | cut -f1)
+    printf '%s' "$old_size" > "$ROOTFS_SIZE_FILE" 2>/dev/null || true
     ui_print "    rootfs 已是当前版本 ($old_size), 跳过解包"
     return 0
   fi
@@ -408,35 +502,64 @@ extract_rootfs() {
   # Verify
   if [ -f "$ROOTFS/app/baihu" ] && [ -f "$ROOTFS/app/docker-entrypoint.sh" ]; then
     printf 'ARCH=%s\nDIGEST=%s\n' "$BAIHU_ARCH" "$new_digest" > "$meta" 2>/dev/null || true
-    ui_print "    解包完成, rootfs=$(du -sh "$ROOTFS" 2>/dev/null | cut -f1)"
+    local rootfs_size
+    rootfs_size=$(du -sh "$ROOTFS" 2>/dev/null | cut -f1)
+    printf '%s' "$rootfs_size" > "$ROOTFS_SIZE_FILE" 2>/dev/null || true
+    ui_print "    解包完成, rootfs=$rootfs_size"
   else
     ui_print "    解包失败: 缺少关键文件"
     ls "$ROOTFS/app/" 2>/dev/null | head -20
     return 1
   fi
 }
-
 # ============================================================
 # Container Management
 # ============================================================
 
+# Resolve the ruri runner. The module ships rurima and creates a `ruri` symlink
+# to it (argv0 dispatch); prefer the symlink if present.
+ruri_bin() {
+  if [ -f "$SCRIPT_DIR/ruri" ]; then
+    echo "$SCRIPT_DIR/ruri"
+  else
+    echo "$SCRIPT_DIR/rurima"
+  fi
+}
+
+# Detect whether network namespaces are usable and emit the ruri flags needed to
+# run a container. An optional extra flag (e.g. "N" to skip the persisted
+# .rurienv) is appended verbatim so callers can special-case without re-probing.
+ruri_flags() {
+  local extra="${1:-}"
+  if "$(ruri_bin)" -p "$ROOTFS" /bin/true 2>/dev/null; then
+    echo "-p -S -A $extra"
+  else
+    echo "-f $extra"
+  fi
+}
+
+# Common ruri flags to enter/manage the container: working dir, container PATH
+# and HOME. Shared by shell/panel/resetpwd/ssh; callers append extra flags and
+# the command. Emitted as an unquoted string so it splices into a command line
+# exactly like $(ruri_flags).
+ruri_env() {
+  printf ' -W /app -e PATH %s -e HOME /root' "$BAIHU_PATH"
+}
+
 ruri_run() {
   export ruri_rexec=1
-  local ruri_bin="$SCRIPT_DIR/ruri"
-  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
 
-  # Check if namespaces are available
-  local ns_flags=""
-  if "$ruri_bin" -p "$ROOTFS" /bin/true 2>/dev/null; then
-    ns_flags="-p -S -A"
-  else
-    ns_flags="-f"
-  fi
+  # -N (--no-rurienv) is mandatory: the persisted .rurienv inside the rootfs
+  # holds a drop_caplist that strips CAP_SYS_ADMIN, which silently breaks the
+  # -m bind mounts and -e env injection below. Skipping it restores the panel's
+  # ability to bind to the configured host:port via BH_CONFIG_PATH.
+  local ns_flags ruri_bin_path
+  ns_flags=$(ruri_flags "-N")
+  ruri_bin_path=$(ruri_bin)
 
-  # Full path from container ENV
-  local BAIHU_PATH="/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  # Full path from container ENV (BAIHU_PATH defined in the common header).
 
-  "$ruri_bin" $ns_flags \
+  "$ruri_bin_path" $ns_flags \
     -W /app \
     -m "$HOME_DIR/data" /app/data \
     -m "$HOME_DIR/configs" /app/configs \
@@ -450,9 +573,44 @@ ruri_run() {
     -e "MISE_CONFIG_DIR" "/app/envs/mise" \
     -e "MISE_TRUSTED_CONFIG_PATHS" "/app/data/scripts" \
     -e "BAIHU_SECRET_KEY" "$(cat "$SECRET_FILE" 2>/dev/null)" \
+    -e "BH_CONFIG_PATH" "/app/data/config.ini" \
+    -e "BH_SERVER_PORT" "${PANEL_PORT:-18052}" \
+    -e "BH_SERVER_HOST" "${PANEL_HOST:-127.0.0.1}" \
     "$ROOTFS" ./docker-entrypoint.sh
 }
 
+# The panel reads its own TOML config (BH_CONFIG_PATH -> /app/data/config.ini,
+# bind-mounted from $HOME_DIR/data/config.ini). This generates that file from
+# the module's PANEL_PORT/PANEL_HOST settings so the panel actually listens on
+# the configured address:port instead of its built-in default.
+write_panel_config() {
+  ensure_panel_config_keys
+  mkdir -p "$HOME_DIR/data"
+  cat > "$HOME_DIR/data/config.ini" << INIEOF
+[server]
+port = ${PANEL_PORT:-18052}
+host = ${PANEL_HOST:-127.0.0.1}
+INIEOF
+  chmod 644 "$HOME_DIR/data/config.ini" 2>/dev/null || true
+}
+
+# Ensure baihu.conf carries the panel listening keys. Older config files written
+# before panel settings existed lack them; append defaults once so the user has a
+# place to edit PANEL_PORT/PANEL_HOST (and the panel stops silently falling back
+# to its built-in default address).
+ensure_panel_config_keys() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  if ! grep -qE '^PANEL_(PORT|HOST)=' "$CONFIG_FILE" 2>/dev/null; then
+    printf '\n# Panel listening settings (change port/host here)\nPANEL_PORT="%s"\nPANEL_HOST="%s"\n' \
+      "${PANEL_PORT:-18052}" "${PANEL_HOST:-127.0.0.1}" >> "$CONFIG_FILE"
+  fi
+  # Older configs predate log retention keys; append defaults so the user has a
+  # place to tune them instead of relying on the script's built-in defaults.
+  if ! grep -qE '^LOG_(RETENTION_DAYS|MAX_SIZE_MB|MAX_ARCHIVES)=' "$CONFIG_FILE" 2>/dev/null; then
+    printf '\n# Log retention (run.log is rotated/pruned on every baihu start)\nLOG_RETENTION_DAYS="%s"\nLOG_MAX_SIZE_MB="%s"\nLOG_MAX_ARCHIVES="%s"\n' \
+      "${LOG_RETENTION_DAYS:-3}" "${LOG_MAX_SIZE_MB:-20}" "${LOG_MAX_ARCHIVES:-5}" >> "$CONFIG_FILE"
+  fi
+}
 # ============================================================
 # Commands
 # ============================================================
@@ -471,9 +629,8 @@ cmd_init() {
     ui_print "  已生成密钥: $secret"
   fi
 
-  # Write default config
-  local default_arch
-  default_arch=$(detect_arch)
+  # Write default config. BAIHU_ARCH is already detected in the common header,
+  # so reuse it instead of re-running detect_arch here.
   cat > "$CONFIG_FILE" << CONFEOF
 # Baihu Panel Configuration
 # This file is sourced by the baihu control script
@@ -481,14 +638,24 @@ cmd_init() {
 # Mirror source (first available is used)
 MIRROR_1="https://ghcr.nju.edu.cn"
 MIRROR_2="https://ghcr.io"
+MIRROR_3="https://ghcr.milu.moe"
 
 # Repository
 BAIHU_REPO="engigu/baihu"
 BAIHU_TAG="latest"
-BAIHU_ARCH="$default_arch"
+BAIHU_ARCH="$BAIHU_ARCH"
 
 # Container settings
 TZ="Asia/Shanghai"
+
+# Panel listening settings (change port/host here)
+PANEL_PORT="18052"
+PANEL_HOST="127.0.0.1"
+
+# Log retention (run.log is rotated/pruned on every baihu start)
+LOG_RETENTION_DAYS="3"
+LOG_MAX_SIZE_MB="20"
+LOG_MAX_ARCHIVES="5"
 CONFEOF
 
   set_perm "$CONFIG_FILE" 644 0 0
@@ -586,7 +753,6 @@ cmd_provision() {
 
 cmd_start() {
   need_bin rurima
-  need_bin curl
 
   # Check if already running
   local pid
@@ -606,19 +772,20 @@ cmd_start() {
 
   ui_print "启动白虎面板容器..."
 
+  # Rotate/prune run.log first (panel is not running yet, so the fd is free).
+  # Keeps the log from filling the data partition over time.
+  run_log_maintenance
+
   # run.log holds the auto-generated admin password: keep it root-only
   touch "$LOG_FILE" 2>/dev/null || true
   chmod 600 "$LOG_FILE" 2>/dev/null || true
 
-  # Wait for network
-  local i=0
-  while [ $i -lt 30 ]; do
-    if curl -sS --max-time 2 http://connect.rom.miui.com/generate_204 >/dev/null 2>&1; then
-      break
-    fi
-    i=$((i + 1))
-    sleep 2
-  done
+  # 容器与宿主共享网络, 启动面板不依赖外网连通性, 无需预探测网络.
+  # 面板应用自行处理网络重试, 外网功能失败不影响本地面板服务.
+
+  # Generate the panel TOML config from PANEL_PORT/PANEL_HOST before launch,
+  # so the panel binds to the configured address instead of its built-in default.
+  write_panel_config
 
   # Start container; capture panel stdout so the generated password lands in run.log
   ruri_run >>"$LOG_FILE" 2>&1 &
@@ -637,9 +804,10 @@ cmd_start() {
   if [ -n "$pid" ]; then
     echo "$pid" > "$DATA_DIR/container.pid"
     ui_print "容器已启动 (PID: $pid)"
-    ui_print "面板地址: http://127.0.0.1:8052"
+    ui_print "面板地址: http://${PANEL_HOST:-127.0.0.1}:${PANEL_PORT:-18052}"
     local pass
     pass=$(get_admin_password)
+    save_admin_password
     if [ -n "$pass" ]; then
       ui_print "管理员账号: admin"
       ui_print "初始密码:   $pass"
@@ -670,9 +838,7 @@ cmd_stop() {
 
   # Umount rootfs
   export ruri_rexec=1
-  local ruri_bin="$SCRIPT_DIR/ruri"
-  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
-  "$ruri_bin" -U "$ROOTFS" 2>/dev/null || true
+  "$(ruri_bin)" -U "$ROOTFS" 2>/dev/null || true
 
   rm -f "$DATA_DIR/container.pid"
   ui_print "已停止"
@@ -692,16 +858,17 @@ cmd_status() {
   else
     echo "  运行状态: 已停止"
   fi
-  echo "  rootfs: $(du -sh "$ROOTFS" 2>/dev/null | cut -f1)"
+  echo "  rootfs: $(rootfs_size)"
   echo "  数据目录: $(du -sh "$HOME_DIR" 2>/dev/null | cut -f1)"
   echo "  配置文件: $CONFIG_FILE"
   echo "  日志文件: $LOG_FILE"
+  echo "  面板地址: http://${PANEL_HOST:-127.0.0.1}:${PANEL_PORT:-18052}"
 
   # Check port (ss preferred, fallback to netstat)
   if command -v ss >/dev/null 2>&1; then
-    ss -tlnp 2>/dev/null | grep -q :8052 && echo "  端口 8052: 监听中"
+    ss -tlnp 2>/dev/null | grep -q ":${PANEL_PORT:-18052}" && echo "  端口 ${PANEL_PORT:-18052}: 监听中"
   elif command -v netstat >/dev/null 2>&1; then
-    netstat -tlnp 2>/dev/null | grep -q :8052 && echo "  端口 8052: 监听中"
+    netstat -tlnp 2>/dev/null | grep -q ":${PANEL_PORT:-18052}" && echo "  端口 ${PANEL_PORT:-18052}: 监听中"
   fi
   echo "===================="
 }
@@ -740,21 +907,135 @@ cmd_shell() {
     abort "rootfs 不存在"
   fi
   export ruri_rexec=1
-  local ruri_bin="$SCRIPT_DIR/ruri"
-  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
-  local ns_flags=""
-  "$ruri_bin" -p "$ROOTFS" /bin/true 2>/dev/null && ns_flags="-p -S -A" || ns_flags="-f"
-  local BAIHU_PATH="/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-  exec "$ruri_bin" $ns_flags \
-    -W /app \
-    -e "PATH" "$BAIHU_PATH" \
-    -e "HOME" "/root" \
+  local ns_flags
+  ns_flags=$(ruri_flags)
+  exec "$(ruri_bin)" $ns_flags $(ruri_env) \
     -e "LANG" "C.UTF-8" \
     -e "LC_ALL" "C.UTF-8" \
     -e "MISE_DATA_DIR" "/app/envs/mise" \
     -e "MISE_CONFIG_DIR" "/app/envs/mise" \
     -e "TERM" "xterm-256color" \
     "$ROOTFS" /bin/sh -l
+}
+
+# Passthrough for official panel commands: baihu panel <cmd> [args...].
+# The panel binary (/app/baihu) already owns the business logic (task, reposync,
+# restore, builtininstall, depinstall, completion, version, resetpwd ...).
+# Reimplementing them here would duplicate and diverge from upstream, so forward
+# the remaining args straight into the container. exec keeps stdio attached so
+# --help output and interactive commands behave exactly as on a normal host.
+cmd_panel() {
+  if [ ! -d "$ROOTFS" ]; then
+    abort "rootfs 不存在, 请先执行 baihu pull"
+  fi
+  if [ $# -eq 0 ]; then
+    echo "用法: baihu panel <官方命令> [参数...]"
+    echo "官方命令: server task reposync resetpwd restore builtininstall depinstall version completion"
+    echo "示例: baihu panel version | baihu panel task --help"
+    return 1
+  fi
+
+  export ruri_rexec=1
+  local ns_flags
+  ns_flags=$(ruri_flags)
+
+  exec "$(ruri_bin)" $ns_flags $(ruri_env) \
+    -e "LANG" "C.UTF-8" \
+    -e "LC_ALL" "C.UTF-8" \
+    "$ROOTFS" /app/baihu "$@"
+}
+
+# Change the panel listening port. Updates PANEL_PORT in baihu.conf, regenerates
+# the panel TOML, and restarts the container so the new port binds immediately.
+cmd_port() {
+  local new_port="$1"
+  if [ -z "$new_port" ]; then
+    echo "用法: baihu port <端口号>"
+    echo "示例: baihu port 18053"
+    return 1
+  fi
+  case "$new_port" in
+    *[!0-9]*|"")
+      echo "! 端口必须是数字 (1-65535)"
+      return 1
+      ;;
+  esac
+  if [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+    echo "! 端口必须在 1-65535 之间"
+    return 1
+  fi
+
+  echo "原端口: ${PANEL_PORT:-18052}"
+  if [ -f "$CONFIG_FILE" ]; then
+    if grep -q '^PANEL_PORT=' "$CONFIG_FILE" 2>/dev/null; then
+      sed "s|^PANEL_PORT=.*|PANEL_PORT=\"$new_port\"|" "$CONFIG_FILE" \
+        > "$CONFIG_FILE.tmp" 2>/dev/null && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE" \
+        || { echo "! 写入配置失败"; return 1; }
+    else
+      echo "PANEL_PORT=\"$new_port\"" >> "$CONFIG_FILE"
+    fi
+  else
+    echo "PANEL_PORT=\"$new_port\"" > "$CONFIG_FILE"
+  fi
+
+  # Reload config to pick up the new value, then regenerate the panel TOML.
+  . "$CONFIG_FILE" 2>/dev/null || true
+  PANEL_PORT="$new_port"
+  write_panel_config
+  echo "端口已修改为: ${PANEL_PORT} (host: ${PANEL_HOST:-127.0.0.1})"
+
+  # Apply immediately if the panel is running, otherwise on next start.
+  local pid
+  pid=$(panel_pids)
+  if [ -n "$pid" ]; then
+    echo "面板运行中, 正在重启以生效..."
+    cmd_stop
+    cmd_start
+  else
+    echo "面板未运行, 下次 baihu start 时生效"
+  fi
+}
+
+# Delete the image cache (rootfs + layers + metadata) to free space and force
+# a fresh download next time. User data under HOME_DIR, the config and the
+# secret key are preserved.
+cmd_clean() {
+  local force=0
+  case "$1" in
+    -y|--yes) force=1 ;;
+  esac
+
+  local before
+  before=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)
+
+  echo "即将删除白虎镜像缓存 (rootfs 约 700MB + layers) 以清理空间。"
+  echo "  删除: rootfs / layers / 镜像元数据"
+  echo "  保留: 用户数据 (home, 配置, 密钥)"
+  echo "  下次需重新下载镜像 (baihu pull 或重装模块)"
+  if [ "$force" -eq 0 ]; then
+    printf "确认清理? 输入 yes 继续: "
+    local ans
+    read ans || ans=""
+    [ "$ans" = "yes" ] || [ "$ans" = "y" ] || { echo "已取消"; return 0; }
+  fi
+
+  # Stop container first so nothing holds the rootfs/layers open.
+  local pid
+  pid=$(panel_pids)
+  if [ -n "$pid" ]; then
+    ui_print "正在停止面板..."
+    cmd_stop
+  fi
+
+  # Purge image cache; keep $HOME_DIR, $CONFIG_FILE and $SECRET_FILE.
+  rm -rf "$ROOTFS" "$LAYERS_DIR" 2>/dev/null || true
+  rm -f "$DATA_DIR/.image_digest" "$DATA_DIR/.rootfs.meta" \
+        "$MANIFEST_FILE" "$CONFIG_BLOB" "$LAYER_LIST" 2>/dev/null || true
+
+  local after
+  after=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)
+  ui_print "清理完成 (数据目录: $before -> $after)"
+  ui_print "下次请执行 baihu pull 或重新安装模块以下载镜像"
 }
 
 cmd_log() {
@@ -775,12 +1056,10 @@ cmd_version() {
   echo "  版本: $(grep 'version=' "$MODDIR/module.prop" 2>/dev/null | cut -d= -f2 || echo 'unknown')"
   echo "  模块路径: $MODDIR"
   echo "  数据路径: $DATA_DIR"
-  local ruri_bin="$SCRIPT_DIR/ruri"
-  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
   # rurima --version opens with a banner whose first line is empty; the real
   # value lives on the "rurima version ............: 0.9.2" line.
   local ruri_ver
-  ruri_ver=$("$ruri_bin" --version 2>/dev/null | awk -F: '/version/ {gsub(/[ \t]/, "", $NF); print $NF; exit}')
+  ruri_ver=$("$(ruri_bin)" --version 2>/dev/null | awk -F: '/version/ {gsub(/[ \t]/, "", $NF); print $NF; exit}')
   [ -n "$ruri_ver" ] || ruri_ver="unknown"
   echo "  ruri: $ruri_ver"
 }
@@ -802,17 +1081,12 @@ cmd_resetpwd() {
     abort "rootfs 不存在"
   fi
   export ruri_rexec=1
-  local ruri_bin="$SCRIPT_DIR/ruri"
-  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
-  local ns_flags=""
-  "$ruri_bin" -p "$ROOTFS" /bin/true 2>/dev/null && ns_flags="-p -S -A" || ns_flags="-f"
+  local ns_flags
+  ns_flags=$(ruri_flags)
   echo "正在进入密码重置界面..."
   echo "用户名: admin"
   echo "------------------------"
-  exec "$ruri_bin" $ns_flags \
-    -W /app \
-    -e "PATH" "/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    -e "HOME" "/root" \
+  exec "$(ruri_bin)" $ns_flags $(ruri_env) \
     "$ROOTFS" /app/baihu resetpwd admin
 }
 
@@ -821,18 +1095,16 @@ cmd_ssh() {
     abort "rootfs 不存在, 请先执行 baihu pull"
   fi
   export ruri_rexec=1
-  local ruri_bin="$SCRIPT_DIR/ruri"
-  [ -f "$ruri_bin" ] || ruri_bin="$SCRIPT_DIR/rurima"
-  local ns_flags=""
-  "$ruri_bin" -p "$ROOTFS" /bin/true 2>/dev/null && ns_flags="-p -S -A" || ns_flags="-f"
-  local BAIHU_PATH="/app/envs/mise/shims:/app/envs/mise/bin:/opt/mise-base/shims:/opt/mise-base/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  local ruri_bin_path ns_flags
+  ruri_bin_path=$(ruri_bin)
+  ns_flags=$(ruri_flags)
 
   # Check if openssh-server is installed
   ui_print "检查 SSH 服务..."
-  if ! "$ruri_bin" $ns_flags -W /app -e PATH "$BAIHU_PATH" -e HOME "/root" "$ROOTFS" \
+  if ! "$ruri_bin_path" $ns_flags $(ruri_env) "$ROOTFS" \
     /bin/sh -c "dpkg -l openssh-server 2>/dev/null | grep -q '^ii'" 2>/dev/null; then
     ui_print "安装 openssh-server (首次需要, 约 1-2 分钟)..."
-    "$ruri_bin" $ns_flags -W /app -e PATH "$BAIHU_PATH" -e HOME "/root" "$ROOTFS" \
+    "$ruri_bin_path" $ns_flags $(ruri_env) "$ROOTFS" \
       /bin/sh -c "apt-get update -qq 2>/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server 2>/dev/null" || {
       ui_print "SSH 安装失败, 请检查网络连接后重试"
       return 1
@@ -842,7 +1114,7 @@ cmd_ssh() {
 
   # Configure sshd: port 8022, root login, password auth
   ui_print "配置 SSH 服务..."
-  "$ruri_bin" $ns_flags -W /app -e PATH "$BAIHU_PATH" -e HOME "/root" "$ROOTFS" \
+  "$ruri_bin_path" $ns_flags $(ruri_env) "$ROOTFS" \
     /bin/sh -c "
       sed -i 's/^#*Port.*/Port 8022/' /etc/ssh/sshd_config
       sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
@@ -853,7 +1125,7 @@ cmd_ssh() {
 
   # Start sshd (-N skips .rurienv check, allows concurrent instance)
   ui_print "启动 SSH 服务 (端口 8022)..."
-  "$ruri_bin" -N $ns_flags \
+  "$ruri_bin_path" -N $ns_flags \
     -e "HOME" "/root" \
     "$ROOTFS" /usr/sbin/sshd -p 8022 2>/dev/null
   sleep 1
@@ -879,7 +1151,6 @@ cmd_ssh() {
   echo ""
   ui_print "SSH 服务已启动"
 }
-
 # ============================================================
 # Main
 # ============================================================
@@ -891,12 +1162,8 @@ if [ -n "$BAIHU_SOURCED" ]; then
   return 0 2>/dev/null || true
 fi
 
-cmd="${1:-help}"
-[ $# -gt 0 ] && shift
-
-case "$cmd" in
-  help|-h|--help)
-    cat <<'HELP'
+print_help() {
+  cat <<'HELP'
 用法: baihu <命令> [选项]
 
 命令:
@@ -908,12 +1175,23 @@ case "$cmd" in
   status     查看运行状态
   update     更新镜像 (stop + pull + provision + start)
   shell      进入容器 shell
+  panel      透传官方面板命令 (baihu panel <官方命令> [参数...])
+  port       修改面板端口 (baihu port <端口号>)
+  clean      删除镜像缓存并重装 (保留用户数据)
   password   查看管理员初始密码
   resetpwd   重置管理员密码 (交互式)
   ssh        安装并启动 SSH 服务 (端口 8022)
   log        查看日志 (默认50行, -f 持续跟踪)
   version    显示版本信息
 HELP
+}
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  help|-h|--help)
+    print_help
     ;;
   init)      cmd_init "$@" ;;
   pull)      cmd_pull "$@" ;;
@@ -923,6 +1201,9 @@ HELP
   status)    cmd_status "$@" ;;
   update)    cmd_update "$@" ;;
   shell)     cmd_shell "$@" ;;
+  panel)     cmd_panel "$@" ;;
+  port)      cmd_port "$@" ;;
+  clean)     cmd_clean "$@" ;;
   password)  cmd_password "$@" ;;
   resetpwd)  cmd_resetpwd "$@" ;;
   ssh)       cmd_ssh "$@" ;;
@@ -930,6 +1211,7 @@ HELP
   version)   cmd_version "$@" ;;
   *)
     echo "未知命令: $cmd"
-    echo "使用 baihu help 查看帮助"
+    echo ""
+    print_help
     ;;
 esac

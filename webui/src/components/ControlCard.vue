@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import { baihu } from '../kernelsu.js'
 
-const props = defineProps({ containerRunning: Boolean })
+const props = defineProps({ containerRunning: Boolean, panelPort: { type: String, default: '18052' } })
 const emit = defineEmits(['refresh'])
 
 const ctrlMsg = ref('')
@@ -16,18 +16,20 @@ async function doStart() {
   ctrlMsgType.value = 'info'
   try {
     const r = await baihu.start()
-    const stdout = r.stdout || ''
-    if (stdout.includes('成功') || stdout.includes('PID')) {
-      ctrlMsg.value = '面板已启动'; ctrlMsgType.value = 'success'
-      emit('refresh')
-    } else if (stdout.includes('已在运行')) {
-      ctrlMsg.value = '面板已在运行中'; ctrlMsgType.value = 'info'
+    const out = r.stdout || ''
+    if (r.errno === 0 && (out.includes('容器已启动') || out.includes('已在运行'))) {
+      ctrlMsg.value = out.includes('已在运行') ? '面板已在运行中' : '面板已启动'
+      ctrlMsgType.value = 'success'
     } else {
-      ctrlMsg.value = stdout.substring(0, 300); ctrlMsgType.value = 'info'
+      ctrlMsg.value = (out.replace(/\n+/g, ' ').trim().substring(0, 300) || '启动失败')
+      ctrlMsgType.value = 'error'
     }
   } catch (e) {
     ctrlMsg.value = '启动失败: ' + (e.message || '未知错误'); ctrlMsgType.value = 'error'
-  } finally { starting.value = false }
+  } finally {
+    starting.value = false
+    emit('refresh')
+  }
 }
 
 async function doStop() {
@@ -36,17 +38,24 @@ async function doStop() {
   ctrlMsgType.value = 'info'
   try {
     const r = await baihu.stop()
-    ctrlMsg.value = '面板已停止'; ctrlMsgType.value = 'success'
-    emit('refresh')
+    const out = (r.stdout || '').trim()
+    if (r.errno === 0 && !out.includes('!')) {
+      ctrlMsg.value = '面板已停止'; ctrlMsgType.value = 'success'
+    } else {
+      ctrlMsg.value = (out.substring(0, 300) || '停止失败'); ctrlMsgType.value = 'error'
+    }
   } catch (e) {
     ctrlMsg.value = '停止失败: ' + (e.message || '未知错误'); ctrlMsgType.value = 'error'
-  } finally { stopping.value = false }
+  } finally {
+    stopping.value = false
+    emit('refresh')
+  }
 }
 
 function openPanel() {
-  const url = 'http://127.0.0.1:8052/'
+  const url = 'http://127.0.0.1:' + (props.panelPort || '18052') + '/'
   const w = window.open(url)
-  if (!w || w.closed) ctrlMsg.value = '请手动访问: ' + url
+  if (!w || w.closed) { ctrlMsg.value = '请手动访问: ' + url; ctrlMsgType.value = 'info' }
 }
 </script>
 

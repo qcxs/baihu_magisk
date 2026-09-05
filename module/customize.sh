@@ -21,8 +21,6 @@ set_perm_recursive $MODPATH/bin 0 2000 0755 0755
 # Force permissions (Magisk set_perm_recursive may not work on some versions)
 chmod -R 0755 $MODPATH/bin 2>/dev/null || true
 chown -R 0:2000 $MODPATH/bin 2>/dev/null || true
-# Create ruri -> rurima symlink for argv0 dispatch
-ln -sf rurima "$MODPATH/bin/ruri" 2>/dev/null || true
 
 # === Architecture-aware binary selection ===
 # Module bundles both arm64 and amd64 binaries; select the correct set.
@@ -40,6 +38,13 @@ for f in "$ARCH_DIR"/*; do
   [ "$f" -ef "$MODPATH/bin/$name" ] 2>/dev/null && continue
   cp -f "$f" "$MODPATH/bin/$name" 2>/dev/null || true
 done
+
+# rurima must exist in bin/ root now (copied above). Create the ruri ->
+# rurima symlink for argv0 dispatch, then resolve the runner. Doing this
+# after the copy avoids a dangling symlink, which would make ruri_bin()
+# fall back to argv0=rurima and print the usage tutorial on every -U call.
+ln -sf rurima "$MODPATH/bin/ruri" 2>/dev/null || true
+RURI_BIN="$(ruri_bin)"
 
 # Verify key binaries are executable
 for bin in rurima curl jq; do
@@ -147,27 +152,23 @@ if [ ! -f "$DATA_DIR/secret.key" ]; then
 fi
 
 if [ ! -f "$DATA_DIR/baihu.conf" ]; then
-  # Detect device architecture
-  local_arch=$(detect_arch)
   cat > "$DATA_DIR/baihu.conf" << CONFEOF
 # Baihu Panel Configuration
 MIRROR_1="https://ghcr.nju.edu.cn"
 MIRROR_2="https://ghcr.io"
 BAIHU_REPO="engigu/baihu"
 BAIHU_TAG="latest"
-BAIHU_ARCH="$local_arch"
+BAIHU_ARCH="$BAIHU_ARCH"
 TZ="Asia/Shanghai"
 CONFEOF
   chmod 644 "$DATA_DIR/baihu.conf"
-  ui_print "- 检测到架构: $local_arch"
+  ui_print "- 检测到架构: $BAIHU_ARCH"
 else
   # Fix architecture in existing config if wrong
   current_arch=$(grep '^BAIHU_ARCH=' "$DATA_DIR/baihu.conf" 2>/dev/null | cut -d= -f2 | tr -d '"')
-  real_arch=$(detect_arch)
-  if [ "$current_arch" != "$real_arch" ]; then
-    ui_print "  ! 架构从 $current_arch 修正为 $real_arch"
-    sed -i "s/^BAIHU_ARCH=.*/BAIHU_ARCH=\"$real_arch\"/" "$DATA_DIR/baihu.conf"
-    BAIHU_ARCH="$real_arch"  # Update runtime variable too
+  if [ "$current_arch" != "$BAIHU_ARCH" ]; then
+    ui_print "  ! 架构从 $current_arch 修正为 $BAIHU_ARCH"
+    sed -i "s/^BAIHU_ARCH=.*/BAIHU_ARCH=\"$BAIHU_ARCH\"/" "$DATA_DIR/baihu.conf"
   fi
 fi
 
@@ -176,8 +177,6 @@ TMP_INSTALL="$DATA_DIR/.tmp/install"
 
 # Clean up stale mounts from previous failed installs
 export ruri_rexec=1
-RURI_BIN="$MODPATH/bin/ruri"
-[ -f "$RURI_BIN" ] || RURI_BIN="$MODPATH/bin/rurima"
 "$RURI_BIN" -U "$TMP_INSTALL/rootfs" 2>/dev/null || true
 rm -rf "$TMP_INSTALL/rootfs" 2>/dev/null || true
 # Final rootfs may also carry stale ruri mounts (blocks redeploy/cleanup below)
@@ -190,9 +189,8 @@ LAYERS_DIR="$TMP_INSTALL/layers"
 ROOTFS="$TMP_INSTALL/rootfs"
 
 ui_print "- 检测网络..."
-# Single 5s timeout probe — retry loops just waste time when the network is down
-if ! curl -sS --connect-timeout 5 -o /dev/null "$MIRROR_NJU/v2/" 2>/dev/null \
-  && ! curl -sS --connect-timeout 5 -o /dev/null "$MIRROR_GHCR/v2/" 2>/dev/null; then
+# 5s timeout via ping, more reliable than curl on early-boot devices
+if ! ping -c 1 -W 5 www.baidu.com >/dev/null 2>&1; then
   abort "网络不可用, 请确认设备已联网后重新刷入"
 fi
 
@@ -223,7 +221,7 @@ fi
 
 # Clean up ruri mounts from previous verification (if any)
 export ruri_rexec=1
-"$MODPATH/bin/ruri" -U "$ROOTFS" 2>/dev/null || true
+"$RURI_BIN" -U "$ROOTFS" 2>/dev/null || true
 sleep 1
 
 # Deploy to final locations. Existence alone is not enough: after an
@@ -270,19 +268,8 @@ ui_print ""
 ui_print "- 配置面板环境..."
 cmd_provision
 
-# Import old data from Qinglong (if exists)
-if [ -d "/data/alpine/ql/data" ] && [ "$IS_UPDATE" -eq 0 ]; then
-  ui_print "- 检测到青龙面板数据, 是否导入?"
-  if volume_key "导入青龙脚本?" 0; then
-    cp -Rafp /data/alpine/ql/data/* "$DATA_DIR/home/data/scripts/" 2>/dev/null || true
-    ui_print "  已导入青龙脚本"
-  fi
-fi
-
 # Clean up residual .rurienv mounts in temp (if any)
 export ruri_rexec=1
-RURI_BIN="$MODPATH/bin/ruri"
-[ -f "$RURI_BIN" ] || RURI_BIN="$MODPATH/bin/rurima"
 "$RURI_BIN" -U "$DATA_DIR/.tmp/install/rootfs" 2>/dev/null || true
 
 ui_print ""
@@ -290,23 +277,14 @@ ui_print "=============================="
 ui_print "  安装完成"
 ui_print "=============================="
 ui_print ""
-ui_print "  面板地址: http://127.0.0.1:8052"
+ui_print "  面板地址: http://${PANEL_HOST:-127.0.0.1}:${PANEL_PORT:-18052}"
 ui_print "  初始密码: 首次启动后自动生成, 见模块页面或 baihu password"
 ui_print ""
-ui_print "  管理命令:"
-ui_print "    baihu start   启动面板"
-ui_print "    baihu stop    停止面板"
-ui_print "    baihu status  查看状态"
-ui_print "    baihu update  更新镜像"
-ui_print "    baihu shell   进入容器"
-ui_print "    baihu log     查看日志"
-ui_print ""
+ui_print "  更多管理命令请运行: baihu help"
 ui_print "  数据目录: $DATA_DIR"
 ui_print "  (卸载模块不会删除数据目录)"
 ui_print "=============================="
 
 # Final cleanup: umount rootfs if mounted
 export ruri_rexec=1
-RURI_BIN="$MODPATH/bin/ruri"
-[ -f "$RURI_BIN" ] || RURI_BIN="$MODPATH/bin/rurima"
 "$RURI_BIN" -U "$DATA_DIR/rootfs" 2>/dev/null || true

@@ -1,0 +1,22 @@
+# Baihu control script — merge order
+#
+# This manifest drives the order in which bin/lib/*.sh are concatenated into
+# bin/baihu by scripts/build.py. Listing fragments explicitly (instead of
+# ordering by filename) means you can insert a new section in the middle
+# without renumbering files.
+#
+# Rules:
+#   - One fragment filename per line (relative to this file's directory).
+#   - Blank lines and lines starting with '#' are ignored.
+#   - Order matters: later fragments may reference functions/vars from earlier.
+#
+# Adjust the entries below when you add, remove or reorder a section.
+
+head.sh
+common.sh
+log.sh
+oci.sh
+rootfs.sh
+container.sh
+commands.sh
+main.sh

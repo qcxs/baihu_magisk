@@ -5,6 +5,7 @@ defineProps({
   uptime: String,
   mem: String,
   portListening: Boolean,
+  panelPort: { type: String, default: '18052' },
   rootfsSize: String,
   dataSize: String,
 })
@@ -32,7 +33,7 @@ defineProps({
       <span class="status-value">{{ mem }}</span>
     </div>
     <div class="status-row">
-      <span class="status-label">端口 8052</span>
+      <span class="status-label">端口 {{ panelPort }}</span>
       <span class="status-value">{{ portListening ? '监听中' : '未监听' }}</span>
     </div>
     <div class="status-row">

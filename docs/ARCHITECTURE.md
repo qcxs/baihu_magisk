@@ -7,7 +7,7 @@
 ```
 +------------------+       +------------------+       +------------------+
 |  Magisk 管理器   |       |  终端 (ADB)      |       |  Web 浏览器      |
-|  (模块 WebUI)    |       |  (baihu 命令)    |       |  (端口 8052)     |
+|  (模块 WebUI)    |       |  (baihu 命令)    |       |  (端口 18052)     |
 +--------+---------+       +--------+---------+       +--------+---------+
          |                          |                          |
          |  exec() 桥接             |  su -c                    |  HTTP
@@ -16,7 +16,7 @@
 |                     Android 宿主机                                |
 |  +------------------------------------------------------------+  |
 |  |  Magisk 模块: /data/adb/modules/baihu_qcxs/                |  |
-|  |  - bin/baihu       (主控脚本, 750+ 行)                     |  |
+|  |  - bin/baihu       (主控脚本, 由 lib/ 片段合并生成)         |  |
 |  |  - bin/rurima      (容器运行时, 静态编译)                   |  |
 |  |  - bin/curl, jq, tar 等 (静态工具集)                       |  |
 |  |  - webroot/index.html      (WebUI 面板)                    |  |
@@ -59,13 +59,36 @@
   module/                 # 模块源文件 (打包进 zip)
     META-INF/             # 安装器
     bin/                  # baihu 主控脚本 + amd64/arm64 二进制
+    bin/lib/              # baihu 的源码片段 (8 个 .sh), 开发时改这里
+      manifest.txt        # 合并顺序清单 (build.py 按此顺序拼接成 bin/baihu)
+      head.sh common.sh log.sh oci.sh rootfs.sh container.sh commands.sh main.sh
     system/               # system/bin/baihu PATH 包装脚本
     webroot/              # 构建时从 webui/dist/ 自动生成
     customize.sh / module.prop / post-fs-data.sh / service.sh / system.prop / uninstall.sh
   scripts/
-    build.py              # 一键构建脚本
+    build.py              # 一键构建脚本 (按 manifest.txt 合并 baihu + 打包 zip)
+  docs/                   # 开发者文档 (架构、开发经验)
   dist/                   # 构建产物 (baihu_qcxs.zip)
 ```
+
+### baihu 源码组织 (lib/ 片段 + manifest.txt)
+
+开发时 `baihu` 不直接写单文件, 而是拆成 `module/bin/lib/` 下的一组片段, 按功能划分:
+
+| 片段 | 职责 |
+|------|------|
+| `head.sh` | shebang、变量、PATH 注入、默认配置 |
+| `common.sh` | 架构探测、工具函数 (log/ui_print/abort/密码提取/PID 探测) |
+| `log.sh` | run.log 轮转与按天清理 |
+| `oci.sh` | OCI 镜像拉取 (token/manifest/layer/校验) |
+| `rootfs.sh` | rootfs 解包与大小缓存 |
+| `container.sh` | ruri 相关公共函数 (`ruri_bin`/`ruri_flags`/`ruri_env`) + 面板 TOML 生成 |
+| `commands.sh` | 各 `cmd_*` 子命令实现 |
+| `main.sh` | 入口分发 `case`、帮助文本、`BAIHU_SOURCED` 守卫 |
+
+`build.py` 的 `combine_baihu()` 按 `manifest.txt` 声明的顺序拼接片段, 也按相同顺序生成 `bin/baihu`。顺序必须在 `manifest.txt` 中显式声明, **不按文件名推断**, 这样在中间插入新片段时无需重命名。
+
+`main.sh` 顶部有 `BAIHU_SOURCED` 守卫: 被 `customize.sh` source 时跳过入口, 只复用函数。
 
 ### 构建产物结构 (安装到设备后)
 
@@ -73,7 +96,7 @@
 /data/adb/modules/baihu_qcxs/
   META-INF/com/google/android/update-binary   # 模块安装器
   bin/
-    baihu                 # 主控脚本 (POSIX sh)
+    baihu                 # 主控脚本 (POSIX sh, 由 lib/ 片段按 manifest.txt 合并)
     rurima  + bin/ruri    # ruri 容器运行时
     curl / jq             # 静态工具集
     amd64/  arm64/        # 架构特定二进制源
@@ -110,23 +133,43 @@
    - 如已挂载则卸载 `/data/baihu/rootfs`
 
 2. `service.sh` (后期启动):
+   - 确保 `baihu` 在 PATH 中: magic mount 未生效时 (如 KernelSU 无元模块), 手动 bind mount 到 `/system/bin/baihu`, 只读则回退 `/sbin/baihu`
    - 阻止设备休眠 (wake_lock + dumpsys deviceidle)
-   - 等待网络就绪 (15 次 x 5 秒, 检测 connect.rom.miui.com)
-   - 检查 rootfs 是否存在
+   - 检查 rootfs 是否存在 (不存在则跳过自启, 提示 `baihu pull`)
    - 通过 nohup 启动 `baihu start`, 输出重定向到 run.log
+   - **不等待网络**: 容器与宿主共享网络, 面板应用自行处理重试
 
 ### 容器启动 (`cmd_start`)
 
 1. 设置环境变量
-2. 等待网络 (30 次 x 2 秒)
-3. 启动 ruri 容器:
-   - 标志: `-p -S -A` (特权模式 + 宿主机运行时 + 取消屏蔽目录)
+2. 日志轮转: 调用 `run_log_maintenance()` 先清理旧日志 (面板未运行时 fd 可用)
+3. 生成面板 TOML: 调用 `write_panel_config()` 把 `PANEL_PORT`/`PANEL_HOST` 写入 `/data/baihu/data/config.ini`
+4. 启动 ruri 容器:
+   - 标志: `$(ruri_flags)` → 命名空间可用时 `-p -S -A`, 否则回退 `-f`; 统一追加 `-N` 跳过 `.rurienv`
    - 工作目录: `-W /app`
    - 绑定挂载: `home/data -> /app/data`, `home/configs -> /app/configs`, `home/envs -> /app/envs`
-   - 环境变量: PATH, HOME, TZ, LANG, MISE_*, BAIHU_SECRET_KEY
+   - 环境变量: PATH, HOME, TZ, LANG, MISE_*, BAIHU_SECRET_KEY, BH_CONFIG_PATH, BH_SERVER_PORT, BH_SERVER_HOST
    - 启动命令: `./docker-entrypoint.sh`
-4. 输出重定向到 run.log (自动生成的密码会出现在这里)
-5. 显示容器 PID 和管理员密码
+5. 输出重定向到 run.log (自动生成的密码会出现在这里)
+6. 等待 5s 后按 `/proc/<pid>/exe` basename 匹配面板 PID, 显示容器 PID 和管理员密码
+
+> 说明: **不等待外网连通**。容器与宿主共享网络, 面板应用自行处理网络重试, 外网失败不影响本地面板服务。
+
+### 关键坑位: `.rurienv` 与 `-N`
+
+rootfs 内持久化的 `.rurienv` 可能含 `drop_caplist`, 会剥离 `CAP_SYS_ADMIN`, 从而静默破坏 `-m` 绑定挂载和 `-e` 环境注入。因此 `cmd_start` / `cmd_shell` / `cmd_panel` / `cmd_resetpwd` 统一带 `-N` (跳过 `.rurienv`), 恢复面板绑定到配置 `host:port` 的能力。
+
+### 面板进程识别 (PID 匹配)
+
+不能直接用 `pidof baihu`——它会把控制脚本自身的进程 (`comm=baihu`, 实际 exe 是 `/system/bin/sh`) 误判为面板。正确做法是遍历 `/proc/<pid>/exe`, 取 basename 等于 `baihu` (面板 Go 二进制的可执行文件名)。见 `common.sh` 的 `panel_pids()`。
+
+### 日志轮转 (`run_log_maintenance`)
+
+`run.log` 无内置轮转, 会无限增长; 面板 stdout 与 `log()` 都在追加。每次 `baihu start` 前执行:
+1. 删除超过 `LOG_RETENTION_DAYS` 天的 `run.log*` 归档
+2. 当前日志超过 `LOG_MAX_SIZE_MB` 时轮转为 `run.log.1`…`run.log.N` (最多 `LOG_MAX_ARCHIVES` 份)
+
+三项均可通过 `/data/baihu/baihu.conf` 配置。轮转只在面板未运行时发生 (面板持有打开的 fd, 改名会导致它写入改名后的 inode)。
 
 ### 容器入口点 (docker-entrypoint.sh)
 
@@ -147,28 +190,32 @@ Debian 根文件系统内的入口脚本执行以下操作:
 ```
 1. fetch_token()      -> GET /v2/token?scope=repository:engigu/baihu:pull
 2. pull_manifest()    -> GET /v2/engigu/baihu/manifests/latest (索引 manifest)
-3. 解析 manifest      -> 提取 amd64 平台特定 manifest
-4. 获取 config blob   -> 解析 config 获取层数量
-5. download_layers()  -> GET /v2/engigu/baihu/blobs/sha256:<digest> (12 层)
-6. extract_rootfs()   -> 两阶段解包:
-   a. 阶段 1: toybox tar 解压 layer-001 (引导层, 包含 GNU tar)
-   b. 阶段 2: chroot 进入 rootfs, 用 GNU tar 解压全部 12 层 (保留绝对符号链接)
+3. 解析 manifest      -> 按 BAIHU_ARCH 选择平台特定 manifest
+4. 获取 config blob   -> 解析 config, 写出 layers.txt (digest/size/mediaType)
+5. download_layers()  -> GET /v2/engigu/baihu/blobs/sha256:<digest>, 逐层校验 sha256
+6. extract_rootfs()   -> 按 layer-001..N 顺序流式解包到 rootfs
 ```
 
-### 镜像源回退
+### 镜像源回退与重试
 
 ```
 MIRROR_1 (ghcr.nju.edu.cn) -> MIRROR_2 (ghcr.io)
 ```
 
-每个 URL 会进行指数退避重试。一个源失败后自动切换到下一个。
+- 每个 URL **单次**请求, 不做退避重试: 失败即判定该源不可用, 切换到下一个源; 全部失败则整体失败, 由用户重跑 `baihu pull`。
+- 已下载且 size + sha256 均匹配的层会跳过, 因此重跑可断点续传。
+- 镜像完整性靠**逐层 sha256 校验**保证, 因此 curl 用 `-k` 跳过 TLS 验证 (Android 无系统 CA), 同时用 `--resolve` (getent/ping 走系统解析器) 绕过缺失的 `/etc/resolv.conf`。
 
-### 两阶段解包
+### rootfs 解包与增量跳过
 
-Android 自带的 toybox tar 会跳过绝对符号链接 (安全考虑)。Docker 镜像层包含大量绝对符号链接 (如 `bin/busybox -> /bin/busybox`), 因此需要 GNU tar:
+`extract_rootfs()` 逐层执行 `gzip -dc layer | tar -xpf - -C $ROOTFS`, 失败时回退 `tar -zpxf`。
 
-- **阶段 1**: 用 toybox tar 只解压 layer-001 (包含 /bin/tar)
-- **阶段 2**: 绑定挂载所有层, chroot 进入 rootfs, 用 GNU tar 解压全部层
+为避免每次重复解包 (~1GB), 解包成功后在 rootfs **同级**写入 `.rootfs.meta` 记录 `ARCH=` / `DIGEST=`:
+
+- 只有「关键文件存在 **且** meta 的架构与镜像 digest 都匹配当前值」才跳过解包;
+- 仅有文件不足以判定新鲜, 否则可能保留一个错误架构的旧 rootfs。
+
+rootfs 解包后不可变 (写入都落在 bind mount 的 home 目录), 因此大小被缓存进 `.rootfs.size`, `baihu status` 不再每次跑 `du -sh`。
 
 ## ruri 容器运行时
 
@@ -230,25 +277,29 @@ ruri (通过 rurima 二进制) 是一个轻量级 Linux 容器运行时。与 Do
 1. 二进制程序生成 12 位随机字母数字密码
 2. 输出到 stdout: `[Init] 密  码: <password>`
 3. stdout 被重定向到 `/data/baihu/run.log`
-4. `get_admin_password()` 从 run.log 提取密码 (第 3 条 [Init] 行)
+4. `get_admin_password()` 优先读 `/data/baihu/.admin_password`, 否则从 run.log 提取 (第 3 条 [Init] 行)
+5. `save_admin_password()` 把密码持久化到 `.admin_password` (600), 使其不受日志轮转/清理影响
 
-`baihu password` 命令读取此文件。`baihu resetpwd` 命令在容器内执行 `baihu resetpwd admin` (交互式)。
+`baihu password` 命令读取上述来源。`baihu resetpwd` 命令在容器内执行 `baihu resetpwd admin` (交互式)。
 
 ## 扩展模块
 
 ### 添加新命令
 
-1. 在 `bin/baihu` 中添加函数:
+1. 在 `module/bin/lib/commands.sh` 中添加函数 (不要直接改 `bin/baihu`, 它是构建产物):
    ```sh
    cmd_mycommand() {
      # 实现代码
    }
    ```
-2. 在 `case` 分支中注册:
+2. 在 `module/bin/lib/main.sh` 的 `case` 分支中注册:
    ```sh
    mycommand)  cmd_mycommand "$@" ;;
    ```
-3. 添加到帮助文本和头部注释
+3. 更新 `main.sh` 的帮助文本
+4. 重新构建: `python scripts/build.py --module-only`
+
+> 新增独立功能片段时, 新建 `lib/<name>.sh` 并在 `manifest.txt` 对应位置登记一行即可, 无需改动已有文件名。
 
 ### 更换镜像
 
@@ -296,17 +347,18 @@ python scripts/build.py --push-webui   # 重建并直接推送到设备 (无需�
 | 限制 | 原因 | 影响 |
 |------|------|------|
 | ~1GB 磁盘占用 | Debian 12 根文件系统 + Mise + Python + Node | 需要 1.5GB 可用空间 |
-| 首次启动慢 | OCI 下载 + 两阶段解包 | 首次安装约 2-5 分钟 |
+| 首次启动慢 | OCI 下载 + rootfs 解包 | 首次安装约 2-5 分钟 |
 | 阻止休眠 | wake_lock 保持设备唤醒 | 运行时增加耗电 |
 | 无 PID 隔离 | ruri -p -S -A 共享宿主机 PID 命名空间 | `ps` 可见容器进程 |
 | 无网络隔离 | 同上 | 容器共享宿主机网络 |
-| 密码明文存储 | stdout 被捕获到 run.log | chmod 600 缓解风险 |
+| 密码明文存储 | stdout 被捕获到 run.log, 并持久化到 .admin_password | 两处均 chmod 600 缓解 |
+| 下载无自动重试 | 单次请求即判定源失败 | 网络抖动需重跑 `baihu pull` (可续传) |
 | `set_perm_recursive` 可能失效 | Magisk R 版本缺陷 | customize.sh 中 chmod -R 回退 |
 
 ## 安全说明
 
 - `secret.key` (JWT 签名密钥) 以 `chmod 600` 存储
-- `run.log` (含明文密码) 以 `chmod 600` 存储
+- `run.log` (含明文密码) 与 `.admin_password` 均以 `chmod 600` 存储
 - WebUI exec() 以 root 运行, 但仅授权管理器 App 可访问
 - 容器以特权模式运行 (-p), 未附加 seccomp 策略
 - 卸载模块不会删除用户数据 (有意设计)
