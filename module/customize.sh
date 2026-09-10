@@ -203,17 +203,36 @@ ROOTFS="$TMP_INSTALL/rootfs"
 BAIHU_REF_ROOTFS="$DATA_DIR/rootfs"
 BAIHU_REF_META="$DATA_DIR/.rootfs.meta"
 
-ui_print "- 检测网络..."
-# 5s timeout via ping, more reliable than curl on early-boot devices
-if ! ping -c 1 -W 5 www.baidu.com >/dev/null 2>&1; then
-  abort "网络不可用, 请确认设备已联网后重新刷入"
+if [ -d "$MODPATH/offline" ] && [ -f "$MODPATH/offline/manifest.json" ]; then
+  # === Offline install path (built-in layers, no network required) ===
+  ui_print "- 检测到离线安装包, 跳过网络下载..."
+  mkdir -p "$LAYERS_DIR"
+  cp "$MODPATH/offline/manifest.json" "$MANIFEST_FILE" 2>/dev/null \
+    || abort "离线清单缺失: manifest.json"
+  cp "$MODPATH/offline/config.json" "$CONFIG_BLOB" 2>/dev/null || true
+  cp "$MODPATH/offline/layers.txt" "$LAYER_LIST" 2>/dev/null \
+    || abort "离线层列表缺失: layers.txt"
+  cp "$MODPATH/offline/.image_digest" "$DATA_DIR/.image_digest" 2>/dev/null || true
+  for f in "$MODPATH/offline/layers"/layer-*; do
+    [ -f "$f" ] && cp "$f" "$LAYERS_DIR/" 2>/dev/null
+  done
+  # Persist bundle provenance info (repo/tag/arch/source/module version)
+  cp "$MODPATH/offline/bundle.info" "$DATA_DIR/.bundle.info" 2>/dev/null || true
+  extract_rootfs || abort "离线 rootfs 解包失败"
+else
+  # === Online install path (standard network pull) ===
+  ui_print "- 检测网络..."
+  # 5s timeout via ping, more reliable than curl on early-boot devices
+  if ! ping -c 1 -W 5 www.baidu.com >/dev/null 2>&1; then
+    abort "网络不可用, 请确认设备已联网后重新刷入"
+  fi
+
+  ui_print "- 检查镜像更新..."
+  ui_print ""
+
+  # Always fetch manifest and check layers; download_layers skips files with matching hash
+  cmd_pull || abort "镜像拉取失败, 安装未完成"
 fi
-
-ui_print "- 检查镜像更新..."
-ui_print ""
-
-# Always fetch manifest and check layers; download_layers skips files with matching hash
-cmd_pull || abort "镜像拉取失败, 安装未完成"
 
 # Verify rootfs integrity. extract_rootfs may have skipped unpacking to the
 # temp dir because the deployed rootfs is already current — in that case the
@@ -301,6 +320,14 @@ cmd_provision
 # Clean up residual .rurienv mounts in temp (if any)
 export ruri_rexec=1
 "$RURI_BIN" -U "$DATA_DIR/.tmp/install/rootfs" 2>/dev/null || true
+
+# === Clean up offline layers from module directory ===
+# Offline layers are deployed to /data/baihu/layers during install and no longer
+# needed in the module partition.  Deleting them here frees module space.
+if [ -d "$MODPATH/offline" ]; then
+  ui_print "- 清理离线安装数据..."
+  rm -rf "$MODPATH/offline"
+fi
 
 ui_print ""
 ui_print "=============================="

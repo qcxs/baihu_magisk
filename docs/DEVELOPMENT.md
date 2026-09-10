@@ -57,15 +57,23 @@ rootfs 内持久化的 `.rurienv` 可能带 `drop_caplist`, 会剥离 `CAP_SYS_A
 
 | 命令 | 作用 |
 |------|------|
-| `python scripts/build.py` | 完整构建: 前端 → 同步 `module/webroot/` → 合并 baihu → 打包 zip |
+| `python scripts/build.py` | 完整构建: 前端 → 同步 `module/webroot/` → 合并 baihu → 打包在线版 zip |
 | `python scripts/build.py --version v1.2.3` | 先写入 `module.prop` 的 version/versionCode, 再完整构建 |
 | `python scripts/build.py --module-only` | 只合并 `lib/` 片段 + 打包 zip (跳过前端, 改脚本时用这个) |
 | `python scripts/build.py --webui-only` | 只构建前端并同步到 `module/webroot/` |
 | `python scripts/build.py --push` | 构建后 adb push zip 到 `/data/local/tmp/` |
 | `python scripts/build.py --install` | 构建 + push + 通过 ksud 安装到设备 |
 | `python scripts/build.py --push-webui` | 重建前端并直接推送 webroot 到已安装模块 (无需重启) |
+| `python scripts/build.py --offline-bundle` | 构建内置版: 下载 arm64 OCI 层 → 打包为 `dist/baihu_qcxs_offline.zip` |
+| `python scripts/build.py --offline-bundle --offline-mirror https://ghcr.nju.edu.cn` | 指定镜像源下载离线层 (不指定则默认 ghcr.io) |
+| `python scripts/build.py --module-only --offline-bundle` | 跳过前端构建, 只打包内置版 (CI 中用, 复用在线版 webroot) |
 
-产物统一为 `dist/baihu_qcxs.zip`。zip 内**不含** `bin/lib/` (构建期片段)。
+产物说明:
+
+| 文件 | 说明 |
+|------|------|
+| `dist/baihu_qcxs.zip` | 在线安装版, 不含镜像层 (~5-8 MB), 安装时需联网 |
+| `dist/baihu_qcxs_offline.zip` | 内置镜像版, 含 arm64 OCI 全部层 (~200+ MB), 安装无需联网 |
 
 ### manifest 校验行为
 
@@ -88,5 +96,29 @@ bash -n module/bin/baihu          # 语法检查, 同时可暴露 CRLF 问题
 
 仓库配置了工作流 [package.yml](../.github/workflows/package.yml): Actions → **Package & Release** → Run workflow。
 
-- 输入版本号 (如 `v1.2.3`): 创建 tag 并发布 GitHub Release, 附带 zip。
-- 留空: 仅打包并上传为 Artifact, 不发布。
+- **输入版本号 (如 `v1.2.3`)**: 创建/更新 tag 并发布 GitHub Release, 同时附带在线版 + 内置版两个 zip。
+- **留空**: 仅打包并上传为 Artifact (两个 zip), 不发布。
+
+> 重复发布同版本号会自动覆盖已有 tag 和 Release (通过 `git tag -f` + `--force push` + `update: true`)。这在构建部分失败时可直接重跑, 无需递增版本号。
+
+#### 离线内置版
+
+在线构建完成后, CI 会额外执行 `python scripts/build.py --module-only --offline-bundle` 从 ghcr.io 下载 arm64 侧的 OCI 层并打包为 `baihu_qcxs_offline.zip`。该步使用了 `continue-on-error: true`, 因网络问题下载失败不会阻断在线版发布。
+
+内置版 zip 内的 `module/offline/` 目录包含:
+- `manifest.json` / `config.json` — OCI 镜像元数据
+- `layers.txt` — 层列表
+- `.image_digest` — 镜像摘要标记
+- `bundle.info` — 来源信息 (仓库、tag、架构、下载源、打包时的模块版本号)
+- `layers/layer-001 ... layer-NNN` — 各层 gzip 压缩包
+
+安装时 `customize.sh` 检测到该目录后跳过网络下载, 直接从模块目录复制层文件 → `extract_rootfs` 解包 → `bundle.info` 写入 `/data/baihu/.bundle.info` → 部署完成后删除 `$MODPATH/offline/` 释放模块分区空间。
+
+本地构建可使用镜像源加速:
+```bash
+# 国内用户指定 NJU 镜像
+python scripts/build.py --offline-bundle --offline-mirror https://ghcr.nju.edu.cn
+
+# CI 中不指定则默认 ghcr.io
+python scripts/build.py --offline-bundle
+```

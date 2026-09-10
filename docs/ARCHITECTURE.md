@@ -121,9 +121,10 @@
    - 创建 `/data/baihu/` 目录结构
    - 如不存在则生成 `secret.key` 和 `baihu.conf`
    - 检测安装模式 (首次安装/升级)
-   - 调用 `cmd_pull()` 下载 OCI 镜像
+   - **在线版**: 调用 `cmd_pull()` 下载 OCI 镜像 (需联网)
+   - **内置版**: `customize.sh` 检测到 `$MODPATH/offline/` 中有预置层 → 直接复制 → `extract_rootfs` (无需联网)
    - 调用 `cmd_provision()` 配置环境
-   - 可选导入青龙面板数据
+   - **内置版清理**: 部署成功后删除 `$MODPATH/offline/` (释放模块分区空间)
 3. 安装成功后, Magisk 将临时目录移到 `/data/adb/modules/baihu_qcxs/`
 
 ### 开机流程
@@ -195,6 +196,8 @@ Debian 根文件系统内的入口脚本执行以下操作:
 5. download_layers()  -> GET /v2/engigu/baihu/blobs/sha256:<digest>, 逐层校验 sha256
 6. extract_rootfs()   -> 按 layer-001..N 顺序流式解包到 rootfs
 ```
+
+> **离线内置版**: 当使用 `baihu_qcxs_offline.zip` 安装时, OCI 层已预置在 `module/offline/layers/` 下, `customize.sh` 跳过以上步骤 1-5, 直接执行 `extract_rootfs`。详见 [DEVELOPMENT.md 离线内置版](../docs/DEVELOPMENT.md#离线内置版)。
 
 ### 镜像源回退与重试
 

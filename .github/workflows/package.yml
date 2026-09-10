@@ -34,7 +34,8 @@ jobs:
           cache: npm
           cache-dependency-path: webui/package-lock.json
 
-      - name: Build & package
+      # --- Online build (standard, no bundled layers) ---
+      - name: Build online package
         run: |
           if [ -n "${{ inputs.version }}" ]; then
             python scripts/build.py --version "${{ inputs.version }}"
@@ -42,29 +43,43 @@ jobs:
             python scripts/build.py
           fi
 
-      - name: Upload zip (no release)
-        # 版本号为空: 仅作为 artifact 保留, 不发布
+      # --- Offline bundle (includes arm64 OCI layers) ---
+      # Reuses the already-built webroot from the online step (--module-only).
+      # --module-only skips webui rebuild and version reset, keeping whatever
+      # the online step wrote into module.prop.
+      - name: Build offline bundle
+        run: python scripts/build.py --module-only --offline-bundle
+        continue-on-error: true   # 离线层下载失败不阻断在线版发布
+
+      - name: List dist/
+        run: ls -lh dist/
+
+      # --- Upload both zips as artifacts (no-release builds) ---
+      - name: Upload zips (no release)
         if: ${{ inputs.version == '' }}
         uses: actions/upload-artifact@v4
         with:
           name: baihu_qcxs-module
-          path: dist/baihu_qcxs.zip
+          path: |
+            dist/baihu_qcxs.zip
+            dist/baihu_qcxs_offline.zip
           if-no-files-found: error
 
+      # --- Release steps (version non-empty) ---
       - name: Show release file info
         if: ${{ inputs.version != '' }}
-        run: ls -lh dist/baihu_qcxs.zip
+        run: ls -lh dist/
 
-      # 版本号非空: 创建 tag, 发布 GitHub Release 并附带 zip
-      - name: Create tag
+      - name: Create or update tag
         if: ${{ inputs.version != '' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "${{ inputs.version }}"
-          git push origin "${{ inputs.version }}"
+          # -f 允许重复发布同版本号时强制覆盖已有 tag
+          git tag -f "${{ inputs.version }}"
+          git push origin --force "${{ inputs.version }}"
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         if: ${{ inputs.version != '' }}
         uses: softprops/action-gh-release@v2
         with:
@@ -77,6 +92,13 @@ jobs:
             - WebUI: Vue 3 + Vite
             - 支持 Magisk / KernelSU / APatch
             - KernelSU 需安装 Hybrid Mount 元模块
+
+            ### 下载说明
+            - **`baihu_qcxs.zip`** — 在线安装版 (较小, 安装时需联网下载镜像)
+            - **`baihu_qcxs_offline.zip`** — 内置镜像版 (较大, 安装无需联网, 仅 arm64)
           draft: false
           prerelease: false
-          files: dist/baihu_qcxs.zip
+          update: true    # 同 tag 已存在 Release 时自动覆盖
+          files: |
+            dist/baihu_qcxs.zip
+            dist/baihu_qcxs_offline.zip

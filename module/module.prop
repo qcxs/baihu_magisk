@@ -1,6 +1,6 @@
 id=baihu_qcxs
 name=白虎面板 Baihu Panel
 version=v1.0.0
-versionCode=2
+versionCode=3
 author=mt论坛青春向上
 description=白虎面板 Magisk/KernelSU/APatch 模块 - 在 Android 设备上运行白虎面板 (Debian 12 + Go + Vue3). 默认端口 18052 仅本机监听, 可在 baihu.conf 修改. 支持升级保留数据. 致敬酷安望月古川. 管理命令: baihu start/stop/status/update

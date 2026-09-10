@@ -1,6 +1,9 @@
 # 白虎面板 Magisk 模块
 
-在 Android 设备上通过 Magisk/KernelSU/APatch 运行 [白虎面板](https://github.com/engigu/baihu-panel)。
+[![GitHub release](https://img.shields.io/github/v/release/qcxs/baihu_magisk)](https://github.com/qcxs/baihu_magisk/releases)
+[![GitHub](https://img.shields.io/github/license/qcxs/baihu_magisk)](LICENSE)
+
+在 Android 设备上通过 Magisk / KernelSU / APatch 模块运行 [白虎面板](https://github.com/engigu/baihu-panel)。
 
 ## 环境要求
 
@@ -10,10 +13,14 @@
 
 ## 安装方法
 
-1. 下载模块 zip 包 (从 [Releases](../../releases) 或自行构建)
-2. 打开管理器 -> 模块 -> 从本地安装
-3. 选择 zip 包, 等待安装完成 (会自动下载白虎镜像并解包, 首次约 2-5 分钟)
-4. 安装完成后即可启动面板
+1. 从 [Releases](https://github.com/qcxs/baihu_magisk/releases) 下载模块 zip 包
+   - **`baihu_qcxs.zip`** — 在线安装版 (较小, 5-8 MB, 安装时需联网下载镜像)
+   - **`baihu_qcxs_offline.zip`** — 内置镜像版 (较大, 200+ MB, 安装无需联网, 仅 arm64)
+2. 打开管理器 → 模块 → 从本地安装
+3. 选择 zip 包, 等待安装完成
+4. 安装完成后在终端执行 `baihu start` 启动面板
+
+> 首次安装 / 在线版会自动下载镜像 (~700MB), 视网络情况约 2-5 分钟。教程: [MT论坛发布帖](https://bbs.binmt.cc/thread-172368-1-1.html)
 
 ## 管理命令
 
@@ -37,7 +44,6 @@ baihu shell                进入容器 shell
 baihu panel <命令>         透传官方面板命令 (如 baihu panel version)
 baihu password             查看管理员初始密码
 baihu resetpwd             重置管理员密码 (交互式)
-baihu ssh                  安装并启动 SSH 服务 (端口 8022)
 baihu log [-f]             查看日志 (默认 50 行, -f 持续跟踪)
 
 # 配置与信息
@@ -47,6 +53,7 @@ baihu help                 显示帮助 (未知命令也会显示)
 ```
 
 面板默认监听 `127.0.0.1:18052`。首次启动约需 1 分钟生成管理员密码, 之后用 `baihu password` 查看。
+
 更高级的配置 (镜像源、日志保留天数等) 在 `/data/baihu/baihu.conf`。
 
 ## 自行构建
@@ -54,8 +61,11 @@ baihu help                 显示帮助 (未知命令也会显示)
 > 需要 Python 3.8+ 和 Node.js 20+。
 
 ```bash
-python scripts/build.py          # 构建前端 + 打包, 产物在 dist/baihu_qcxs.zip
-python scripts/build.py --install  # 构建并通过 ksud 安装到已连接的设备
+python scripts/build.py                        # 在线版: dist/baihu_qcxs.zip
+python scripts/build.py --offline-bundle        # 内置版: dist/baihu_qcxs_offline.zip (需下载层)
+python scripts/build.py --offline-bundle --offline-mirror https://ghcr.nju.edu.cn  # 指定镜像源
+python scripts/build.py --version v1.2.3        # 指定版本构建
+python scripts/build.py --install               # 构建并通过 ksud 安装到已连接的设备
 ```
 
 完整构建参数、发布流程见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
@@ -72,6 +82,13 @@ python scripts/build.py --install  # 构建并通过 ksud 安装到已连接的�
 └── .github/
     └── workflows/  # GitHub Actions 工作流
 ```
+
+## 链接
+
+- **项目仓库**: [github.com/qcxs/baihu_magisk](https://github.com/qcxs/baihu_magisk)
+- **发布下载**: [Releases](https://github.com/qcxs/baihu_magisk/releases)
+- **白虎面板**: [github.com/engigu/baihu-panel](https://github.com/engigu/baihu-panel)
+- **教程帖**: [MT论坛](https://bbs.binmt.cc/thread-172368-1-1.html)
 
 ## 开发者文档
 

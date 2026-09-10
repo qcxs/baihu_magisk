@@ -15,13 +15,15 @@ Requirements:
   - adb (for --push / --install)
 """
 
-import os, sys, shutil, subprocess, zipfile, argparse
+import os, sys, shutil, subprocess, zipfile, argparse, json, hashlib, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEBUI_DIR = os.path.join(ROOT, 'webui')
 MODULE_DIR = os.path.join(ROOT, 'module')
 DIST_DIR = os.path.join(ROOT, 'dist')
 OUTPUT_ZIP = os.path.join(DIST_DIR, 'baihu_qcxs.zip')
+OUTPUT_OFFLINE_ZIP = os.path.join(DIST_DIR, 'baihu_qcxs_offline.zip')
+OFFLINE_DIR = os.path.join(MODULE_DIR, 'offline')
 BAIHU_BIN = os.path.join(MODULE_DIR, 'bin', 'baihu')
 BAIHU_LIB_DIR = os.path.join(MODULE_DIR, 'bin', 'lib')
 BAIHU_MANIFEST = os.path.join(BAIHU_LIB_DIR, 'manifest.txt')
@@ -119,17 +121,28 @@ def combine_baihu():
     os.chmod(BAIHU_BIN, 0o755)
     log(f'Merged {len(frags)} lib fragments (manifest order) -> bin/baihu ({len(merged)} bytes)')
 
-def pack_zip():
-    """Pack module/ into a KernelSU-compatible zip."""
+def pack_zip(output_path=None, extra_exclude=None):
+    """Pack module/ into a KernelSU-compatible zip.
+
+    Args:
+        output_path: Output zip path (default: OUTPUT_ZIP).
+        extra_exclude: Extra set of directory/file names to exclude.
+    """
     # Always (re)build bin/baihu from lib/ fragments first so the zip ships the
     # latest merged script, regardless of whether it was edited in the repo.
     combine_baihu()
-    os.makedirs(DIST_DIR, exist_ok=True)
-    if os.path.exists(OUTPUT_ZIP):
-        os.remove(OUTPUT_ZIP)
 
-    def should_exclude(name):
-        for pat in EXCLUDE_IN_ZIP:
+    output = output_path or OUTPUT_ZIP
+    exclude = set(EXCLUDE_IN_ZIP)
+    if extra_exclude:
+        exclude.update(extra_exclude)
+
+    os.makedirs(DIST_DIR, exist_ok=True)
+    if os.path.exists(output):
+        os.remove(output)
+
+    def should_exclude(name, exclude_set):
+        for pat in exclude_set:
             if pat.startswith('*'):
                 if name.endswith(pat[1:]):
                     return True
@@ -145,19 +158,19 @@ def pack_zip():
             return 0o644
         return 0o644
 
-    with zipfile.ZipFile(OUTPUT_ZIP, 'w', zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as z:
         for dirpath, dirnames, filenames in os.walk(MODULE_DIR):
             # Filter exclusions
-            dirnames[:] = [d for d in dirnames if d not in EXCLUDE_IN_ZIP and not d.startswith('.')]
+            dirnames[:] = [d for d in dirnames if d not in exclude and not d.startswith('.')]
             for fn in filenames:
-                if should_exclude(fn):
+                if should_exclude(fn, exclude):
                     continue
                 full = os.path.join(dirpath, fn)
                 rel = os.path.relpath(full, MODULE_DIR).replace('\\', '/')
                 # lib/*.sh are build-time fragments merged into bin/baihu; never ship them.
                 if rel.startswith('bin/lib/'):
                     continue
-                if rel.split('/')[0] in EXCLUDE_IN_ZIP:
+                if rel.split('/')[0] in exclude:
                     continue
                 info = zipfile.ZipInfo(rel, date_time=(2026, 9, 4, 0, 0, 0))
                 info.external_attr = (0o100000 | perm(rel)) << 16
@@ -165,8 +178,8 @@ def pack_zip():
                 with open(full, 'rb') as f:
                     z.writestr(info, f.read())
 
-    size = os.path.getsize(OUTPUT_ZIP)
-    log(f'Packed {OUTPUT_ZIP} ({size/1024/1024:.1f} MB, {len(z.infolist())} files)')
+    size = os.path.getsize(output)
+    log(f'Packed {output} ({size/1024/1024:.1f} MB, {len(z.infolist())} files)')
 
 def push_to_device():
     """Push zip to device via adb."""
@@ -235,6 +248,232 @@ def set_version(version):
     else:
         log(f'Set module version=v{ver} (versionCode fallback kept)')
 
+
+# ============================================================
+# Offline bundle (built-in image layers)
+# ============================================================
+# The offline bundle pre-packages the OCI image layers for arm64 inside the
+# module zip so the device can install without network access. The build script
+# downloads the layers from ghcr.io during CI, places them under module/offline/,
+# and customize.sh detects and deploys them at install time.
+
+BAIHU_REPO = "engigu/baihu"
+BAIHU_TAG = "latest"
+BAIHU_REGISTRY = "https://ghcr.io"
+OCI_ARCH = "arm64"
+
+
+def _oci_token(registry="https://ghcr.io"):
+    """Fetch anonymous bearer token from the OCI registry."""
+    # The token endpoint is always on the real registry (ghcr.io), not on
+    # pull-through mirrors. Mirrors like ghcr.nju.edu.cn forward the token to
+    # the upstream, so we always fetch from ghcr.io.
+    url = f"https://ghcr.io/token?scope=repository:{BAIHU_REPO}:pull&service=ghcr.io"
+    req = urllib.request.Request(url)
+    req.add_header('Accept', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get('token', '')
+    except Exception as e:
+        log(f'ERROR: failed to get OCI token: {e}')
+        sys.exit(1)
+
+
+def _oci_fetch(url, accept, token):
+    """Fetch a URL with bearer auth + Accept header, return bytes."""
+    req = urllib.request.Request(url)
+    req.add_header('Authorization', f'Bearer {token}')
+    if accept:
+        req.add_header('Accept', accept)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        log(f'ERROR: HTTP {e.code} fetching {url}')
+        if e.code == 401:
+            log('  (ghcr.io returned 401 — the public repo may require auth)')
+        sys.exit(1)
+    except Exception as e:
+        log(f'ERROR: failed to fetch {url}: {e}')
+        sys.exit(1)
+
+
+def _get_module_version():
+    """Read the current version from module.prop."""
+    prop = os.path.join(MODULE_DIR, 'module.prop')
+    try:
+        for line in open(prop, encoding='utf-8'):
+            if line.startswith('version='):
+                return line.strip().split('=', 1)[1]
+    except Exception:
+        pass
+    return None
+
+
+def fetch_oci_offline(offline_dir, mirror_url=None):
+    """Download arm64 OCI manifest + config + all layers into offline_dir.
+
+    Args:
+        offline_dir: Target directory under module/offline/.
+        mirror_url: OCI registry mirror URL (e.g. https://ghcr.nju.edu.cn).
+            Defaults to https://ghcr.io.
+
+    Creates the following structure:
+      offline_dir/
+        manifest.json     # arch-specific OCI manifest
+        config.json       # image config blob
+        layers.txt        # tab-separated digest/size/mediaType per layer
+        .image_digest     # IMAGE_DIGEST=sha256sum-of-all-layer-digests
+        bundle.info       # provenance: repo, tag, arch, source, module version
+        layers/
+          layer-001       # gzipped layer tarball
+          layer-002       # ...
+    """
+    registry = (mirror_url or BAIHU_REGISTRY).rstrip('/')
+    log(f'Fetching arm64 OCI image layers for offline bundle from {registry}...')
+    token = _oci_token()
+
+    # --- Step 1: fetch index manifest ---
+    index_url = f"{registry}/v2/{BAIHU_REPO}/manifests/{BAIHU_TAG}"
+    accept_idx = (
+        "application/vnd.oci.image.index.v1+json,"
+        "application/vnd.docker.distribution.manifest.list.v2+json"
+    )
+    raw = _oci_fetch(index_url, accept_idx, token)
+    index = json.loads(raw)
+
+    # --- Step 2: find arm64 digest in the index ---
+    arch_digest = None
+    if 'manifests' in index:
+        for m in index['manifests']:
+            if m.get('platform', {}).get('architecture') == OCI_ARCH:
+                arch_digest = m['digest']
+                break
+        if not arch_digest:
+            log(f'ERROR: no {OCI_ARCH} manifest found in index')
+            sys.exit(1)
+        # Fetch the arch-specific manifest
+        accept_manifest = (
+            "application/vnd.oci.image.manifest.v1+json,"
+            "application/vnd.docker.distribution.manifest.v2+json"
+        )
+        raw = _oci_fetch(
+            f"{registry}/v2/{BAIHU_REPO}/manifests/{arch_digest}",
+            accept_manifest, token
+        )
+        manifest = json.loads(raw)
+    else:
+        # Direct manifest (single-arch image)
+        manifest = index
+
+    # Write manifest.json
+    os.makedirs(offline_dir, exist_ok=True)
+    with open(os.path.join(offline_dir, 'manifest.json'), 'w') as f:
+        json.dump(manifest, f, indent=2)
+
+    # --- Step 3: fetch config blob ---
+    config_digest = manifest['config']['digest']
+    raw = _oci_fetch(
+        f"{registry}/v2/{BAIHU_REPO}/blobs/{config_digest}",
+        '', token
+    )
+    config = json.loads(raw)
+    with open(os.path.join(offline_dir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=2)
+
+    # --- Step 4: download layers ---
+    layers_dir = os.path.join(offline_dir, 'layers')
+    os.makedirs(layers_dir, exist_ok=True)
+
+    layer_entries = []
+    total_hasher = hashlib.sha256()
+    total = len(manifest['layers'])
+
+    for i, layer in enumerate(manifest['layers'], 1):
+        digest = layer['digest']
+        size = layer['size']
+        media_type = layer.get('mediaType', '')
+        layer_entries.append(f"{digest}\t{size}\t{media_type}\n")
+        total_hasher.update(digest.encode())
+
+        layer_name = f"layer-{i:03d}"
+        layer_file = os.path.join(layers_dir, layer_name)
+        sha_expected = digest.replace('sha256:', '')
+
+        log(f'  [{i}/{total}] {layer_name} ({size / 1024 / 1024:.1f} MB)')
+
+        raw = _oci_fetch(
+            f"{registry}/v2/{BAIHU_REPO}/blobs/{digest}",
+            '', token
+        )
+
+        # Verify sha256
+        actual_sha = hashlib.sha256(raw).hexdigest()
+        if actual_sha != sha_expected:
+            log(f'ERROR: {layer_name} sha256 mismatch '
+                f'(expected {sha_expected}, got {actual_sha})')
+            sys.exit(1)
+
+        with open(layer_file, 'wb') as f:
+            f.write(raw)
+
+        log(f'    verified sha256: {actual_sha[:16]}... OK')
+
+    # Write layers.txt
+    with open(os.path.join(offline_dir, 'layers.txt'), 'w') as f:
+        f.writelines(layer_entries)
+
+    # Write .image_digest (cumulative hash of all layer digests)
+    image_digest = total_hasher.hexdigest()
+    with open(os.path.join(offline_dir, '.image_digest'), 'w') as f:
+        f.write(f"IMAGE_DIGEST={image_digest}\n")
+
+    # Write bundle.info (provenance metadata)
+    mod_ver = _get_module_version() or 'unknown'
+    with open(os.path.join(offline_dir, 'bundle.info'), 'w') as f:
+        f.write(f"BAIHU_REPO={BAIHU_REPO}\n")
+        f.write(f"BAIHU_TAG={BAIHU_TAG}\n")
+        f.write(f"BAIHU_ARCH={OCI_ARCH}\n")
+        f.write(f"SOURCE_MIRROR={registry}\n")
+        f.write(f"MODULE_VERSION={mod_ver}\n")
+
+    log(f'Offline layers prepared: {total} layers, '
+        f'{sum(l["size"] for l in manifest["layers"]) / 1024 / 1024:.0f} MB raw')
+    return True
+
+
+def pack_offline_zip(mirror_url=None):
+    """Build the offline bundle zip (includes bundled arm64 OCI layers).
+
+    Args:
+        mirror_url: OCI registry mirror URL for downloading layers.
+            Defaults to https://ghcr.io.
+
+    1. Download OCI layers to module/offline/.
+    2. Pack the full module/ (including offline/).
+    3. Clean up module/offline/ so git is not polluted.
+    """
+    # Clean any stale offline dir from a previous failed run
+    if os.path.exists(OFFLINE_DIR):
+        shutil.rmtree(OFFLINE_DIR)
+
+    fetch_oci_offline(OFFLINE_DIR, mirror_url=mirror_url)
+
+    # Regenerate bin/baihu inside pack_zip (via combine_baihu) so the fragment
+    # merge is always fresh. The extra_exclude set is deliberately empty here:
+    # we WANT the offline/ dir to be included.
+    pack_zip(output_path=OUTPUT_OFFLINE_ZIP, extra_exclude=set())
+
+    # Clean up — the offline data is inside the zip, no need to keep it on disk
+    shutil.rmtree(OFFLINE_DIR)
+    log('Cleaned up module/offline/')
+
+    offline_size = os.path.getsize(OUTPUT_OFFLINE_ZIP)
+    online_size = os.path.getsize(OUTPUT_ZIP)
+    log(f'Online  zip: {online_size / 1024 / 1024:.1f} MB')
+    log(f'Offline zip: {offline_size / 1024 / 1024:.1f} MB')
+
 def push_webui_to_device():
     """Push updated webroot directly to module dir (no reboot needed)."""
     src = os.path.join(WEBUI_DIR, 'dist')
@@ -255,10 +494,20 @@ def main():
     parser.add_argument('--module-only', action='store_true', help='Only re-zip module/ (skip webui)')
     parser.add_argument('--push-webui', action='store_true', help='Push webroot to device directly (no reboot)')
     parser.add_argument('--version', help='Set module version (e.g. v1.2.3) before building')
+    parser.add_argument('--offline-bundle', action='store_true',
+                        help='Build offline bundle (includes arm64 OCI layers)')
+    parser.add_argument('--offline-mirror',
+                        help='Mirror URL for offline bundle download (default: https://ghcr.io)')
     args = parser.parse_args()
 
+    # Version logic:
+    #   --version → explicit version (online or offline build)
+    #   --offline-bundle without --version → keep whatever is in module.prop
+    #   otherwise → set DEFAULT_VERSION (1.0.0)
     if args.version:
         set_version(args.version)
+    elif args.offline_bundle:
+        pass  # preserve existing module.prop version
     elif not (args.push_webui or args.webui_only):
         # Default/local packaging: unless --version is given, the module always
         # ships the default release version (1.0.0). This keeps a plain local
@@ -278,14 +527,23 @@ def main():
         sync_webroot()
         return
 
-    if args.module_only:
-        pack_zip()
+    if args.offline_bundle:
+        # Build webui unless --module-only also given (reuse existing webroot)
+        if not args.module_only:
+            build_webui()
+            sync_webroot()
+        pack_offline_zip(mirror_url=args.offline_mirror)
         return
 
-    # Full build
+    if args.module_only:
+        # Online build: exclude offline/ from the zip
+        pack_zip(extra_exclude={'offline'})
+        return
+
+    # Full build (online)
     build_webui()
     sync_webroot()
-    pack_zip()
+    pack_zip(extra_exclude={'offline'})
 
     if args.push:
         push_to_device()
