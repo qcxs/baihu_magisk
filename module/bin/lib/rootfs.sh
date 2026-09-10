@@ -64,8 +64,9 @@ extract_rootfs() {
     return 1
   fi
 
-  local count=0
-  for layer in $(ls "$LAYERS_DIR"/layer-* 2>/dev/null | sort); do
+  local count=0 layer
+  for layer in "$LAYERS_DIR"/layer-*; do
+    [ -f "$layer" ] || continue
     count=$((count + 1))
     local name
     name=$(basename "$layer")

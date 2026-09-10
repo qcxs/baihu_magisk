@@ -66,7 +66,7 @@ if [ ! -x "$BB" ]; then
 fi
 BB_APPLETS="tar gzip gunzip unzip xz unxz cat grep sed awk cut tr head tail wc sort uniq
   basename dirname date df du find mkdir rmdir rm cp mv ln chmod chown touch stat readlink
-  sleep kill pidof pkill mount umount seq nohup setsid ip printf sha256sum md5sum free"
+  sleep kill pidof pkill mount umount seq nohup setsid ip printf sha256sum md5sum free timeout"
 ui_print "- 链接 busybox applet..."
 BB_LIST=$("$BB" --list 2>/dev/null | tr '\n' ' ')
 for applet in $BB_APPLETS; do
@@ -247,6 +247,8 @@ if [ ! -f "$VERIFY_ROOTFS/app/baihu" ] || [ ! -f "$VERIFY_ROOTFS/app/docker-entr
 fi
 
 # Verify rootfs with dynamic linker (more reliable than ruri -p on some devices)
+# Use timeout to prevent hanging: the glibc dynamic linker is a native Linux
+# binary, and Android (bionic) may not handle it gracefully on all kernels.
 ui_print "- 校验 rootfs..."
 ld_path=$(find "$VERIFY_ROOTFS" -name 'ld-linux-*' -type f 2>/dev/null | head -1)
 if [ -n "$ld_path" ]; then
@@ -254,7 +256,7 @@ if [ -n "$ld_path" ]; then
   if [ "$BAIHU_ARCH" = "amd64" ]; then
     lib_paths="$VERIFY_ROOTFS/lib/x86_64-linux-gnu:$VERIFY_ROOTFS/usr/lib/x86_64-linux-gnu"
   fi
-  if ! "$ld_path" --library-path "$lib_paths" "$VERIFY_ROOTFS/bin/true" 2>/dev/null; then
+  if ! timeout 15 "$ld_path" --library-path "$lib_paths" "$VERIFY_ROOTFS/bin/true" 2>/dev/null; then
     ui_print "  ! 动态链接器校验跳过 (非致命)"
   fi
 fi
@@ -287,8 +289,44 @@ fi
 if [ $need_deploy -eq 1 ]; then
   ui_print "- 部署 rootfs..."
   "$RURI_BIN" -U "$DATA_DIR/rootfs" 2>/dev/null || true
-  rm -rf "$DATA_DIR/rootfs" 2>/dev/null || true
-  cp -r "$TMP_INSTALL/rootfs" "$DATA_DIR/rootfs" || abort "部署 rootfs 失败"
+  # Atomically replace rootfs: move old aside (backup), move new in place,
+  # then clean up the backup.  This is safer than rm + cp:
+  #   - mv on /data/baihu is always same-filesystem → instant + atomic
+  #   - the old rootfs is preserved if the device reboots mid-operation
+  #   - rollback is trivial (swap the two dirs back)
+  if [ -d "$DATA_DIR/rootfs" ]; then
+    rm -rf "$DATA_DIR/.rootfs.backup" 2>/dev/null || true
+    mv "$DATA_DIR/rootfs" "$DATA_DIR/.rootfs.backup" 2>/dev/null || true
+  fi
+  mv "$TMP_INSTALL/rootfs" "$DATA_DIR/rootfs" 2>/dev/null || {
+    # Rollback: restore backup if the atomic move failed
+    if [ -d "$DATA_DIR/.rootfs.backup" ]; then
+      mv "$DATA_DIR/.rootfs.backup" "$DATA_DIR/rootfs" 2>/dev/null || true
+    fi
+    abort "部署 rootfs 失败"
+  }
+
+  # === Explicit data migration from previous rootfs ===
+  # Copy app data paths from the OLD rootfs backup into the NEW rootfs.
+  # The primary data path is via bind mounts (/data/baihu/home/ → /app/),
+  # but this explicit copy acts as a safety net: if bind mounts fail, or
+  # if data was saved outside the standard mount paths during the previous
+  # deployment, it is still accessible inside the new rootfs.
+  # (Inspired by netinstall2.0's explicit cp -Rafp approach.)
+  if [ -d "$DATA_DIR/.rootfs.backup/app" ]; then
+    ui_print "- 迁移用户数据..."
+    for _d in data configs envs; do
+      _src="$DATA_DIR/.rootfs.backup/app/$_d"
+      _dst="$DATA_DIR/rootfs/app/$_d"
+      if [ -d "$_src" ] && [ -n "$(ls -A "$_src" 2>/dev/null)" ]; then
+        mkdir -p "$_dst" 2>/dev/null
+        cp -Rafp "$_src"/* "$_dst/" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  # Clean up backup (old rootfs) after successful deploy
+  rm -rf "$DATA_DIR/.rootfs.backup" 2>/dev/null || true
   cp "$TMP_META" "$DATA_META" 2>/dev/null || true
   # Layers of a different arch/digest reuse the same layer-NNN names: drop
   # the stale cache so the sync below copies the current set

@@ -48,7 +48,15 @@ jobs:
       # --module-only skips webui rebuild and version reset, keeping whatever
       # the online step wrote into module.prop.
       - name: Build offline bundle
-        run: python scripts/build.py --module-only --offline-bundle
+        # Pass the same version so both zips carry the same release metadata.
+        # Each build is a separate process and module/module.prop is never
+        # mutated (version is overlaid into the zip at pack time).
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            python scripts/build.py --module-only --offline-bundle --version "${{ inputs.version }}"
+          else
+            python scripts/build.py --module-only --offline-bundle
+          fi
         continue-on-error: true   # 离线层下载失败不阻断在线版发布
 
       - name: List dist/

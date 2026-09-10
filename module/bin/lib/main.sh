@@ -52,7 +52,6 @@ case "$cmd" in
   clean)     cmd_clean "$@" ;;
   password)  cmd_password "$@" ;;
   resetpwd)  cmd_resetpwd "$@" ;;
-  ssh)       cmd_ssh "$@" ;;
   log)       cmd_log "$@" ;;
   version)   cmd_version "$@" ;;
   *)

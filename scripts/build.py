@@ -20,10 +20,16 @@ import os, sys, shutil, subprocess, zipfile, argparse, json, hashlib, urllib.req
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEBUI_DIR = os.path.join(ROOT, 'webui')
 MODULE_DIR = os.path.join(ROOT, 'module')
+TMP_DIR = os.path.join(ROOT, 'tmp')
 DIST_DIR = os.path.join(ROOT, 'dist')
 OUTPUT_ZIP = os.path.join(DIST_DIR, 'baihu_qcxs.zip')
 OUTPUT_OFFLINE_ZIP = os.path.join(DIST_DIR, 'baihu_qcxs_offline.zip')
-OFFLINE_DIR = os.path.join(MODULE_DIR, 'offline')
+
+# Offline layers are downloaded to tmp/offline/ (gitignored) and briefly copied
+# to module/offline/ immediately before packing so they end up inside the zip.
+# The module-level path is cleaned up right after packing.
+OFFLINE_DIR = os.path.join(TMP_DIR, 'offline')
+MODULE_OFFLINE_DIR = os.path.join(MODULE_DIR, 'offline')
 BAIHU_BIN = os.path.join(MODULE_DIR, 'bin', 'baihu')
 BAIHU_LIB_DIR = os.path.join(MODULE_DIR, 'bin', 'lib')
 BAIHU_MANIFEST = os.path.join(BAIHU_LIB_DIR, 'manifest.txt')
@@ -175,8 +181,13 @@ def pack_zip(output_path=None, extra_exclude=None):
                 info = zipfile.ZipInfo(rel, date_time=(2026, 9, 4, 0, 0, 0))
                 info.external_attr = (0o100000 | perm(rel)) << 16
                 info.compress_type = zipfile.ZIP_DEFLATED
-                with open(full, 'rb') as f:
-                    z.writestr(info, f.read())
+                # module.prop: overlay the effective release version/versionCode
+                # instead of the pristine repo file (repo file is never mutated).
+                if rel == 'module.prop':
+                    z.writestr(info, module_prop_bytes())
+                else:
+                    with open(full, 'rb') as f:
+                        z.writestr(info, f.read())
 
     size = os.path.getsize(output)
     log(f'Packed {output} ({size/1024/1024:.1f} MB, {len(z.infolist())} files)')
@@ -209,44 +220,63 @@ def git_commit_count():
     except Exception:
         return None
 
-def set_version(version):
-    """Write module/module.prop version and versionCode.
+# Release version/versionCode to inject into the packed zip at build time.
+# These are kept OUT of the tracked module/module.prop: the repo file always
+# holds the default, and the packed zip carries the effective release values,
+# so local builds and CI never dirty git with a transient versionCode bump.
+PACK_VERSION = None   # e.g. 'v1.2.3' (with 'v' prefix); None => use repo default line
+PACK_VERSIONCODE = None  # int (git commit count) or None => keep repo default line
 
-    version: user release tag, e.g. 'v1.2.3' or '1.2.3' (the 'v' prefix is
-    normalized to 'vN.N.N').
+def resolve_release(version):
+    """Compute the effective version label + versionCode for this build.
 
-    versionCode is the git commit count, not something derived from the version
-    string, so it stays monotonic as development progresses. When git is not
-    available the existing versionCode line in module.prop is left untouched as
-    a fallback (relevant for local packaging of a plain repo zip).
+    Args:
+        version: user release tag e.g. 'v1.2.3' or '1.2.3', or None for default.
+
+    Sets module-level PACK_VERSION / PACK_VERSIONCODE. Does NOT modify the
+    tracked module/module.prop file.
+    """
+    global PACK_VERSION, PACK_VERSIONCODE
+    if version:
+        label = 'v' + version.lstrip('v').strip()
+    else:
+        label = DEFAULT_VERSION if DEFAULT_VERSION.startswith('v') else 'v' + DEFAULT_VERSION
+    code = git_commit_count()
+    PACK_VERSION = label
+    PACK_VERSIONCODE = code
+    if code is not None:
+        log(f'Release: version={label} versionCode={code} (git commits)')
+    else:
+        log(f'Release: version={label} (versionCode fallback kept)')
+
+def module_prop_bytes():
+    """Return module.prop content with PACK_VERSION / PACK_VERSIONCODE applied.
+
+    The tracked module/module.prop is read (never written); version lines are
+    overlaid only in the returned bytes, which is what ends up in the zip.
     """
     prop = os.path.join(MODULE_DIR, 'module.prop')
-    ver = version.lstrip('v').strip()
-    code = git_commit_count()
-
-    text = open(prop, encoding='utf-8').read()
+    text = open(prop, encoding='utf-8', newline='').read()
     lines = text.splitlines()
     out = []
     replaced = {'version': False, 'versionCode': False}
     for ln in lines:
         if ln.startswith('version=') and not replaced['version']:
-            out.append(f'version=v{ver}'); replaced['version'] = True
+            out.append(f'version={PACK_VERSION or ln.split("=", 1)[1]}')
+            replaced['version'] = True
         elif ln.startswith('versionCode=') and not replaced['versionCode']:
+            if PACK_VERSIONCODE is not None:
+                out.append(f'versionCode={PACK_VERSIONCODE}')
+            else:
+                out.append(ln)
             replaced['versionCode'] = True
-            # Keep the fallback value unless we have a real commit count.
-            out.append(f'versionCode={code}' if code is not None else ln)
         else:
             out.append(ln)
-    if not replaced['version']:
-        out.append(f'version=v{ver}')
-    if not replaced['versionCode'] and code is not None:
-        out.append(f'versionCode={code}')
-    open(prop, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
-
-    if code is not None:
-        log(f'Set module version=v{ver} versionCode={code} (git commits)')
-    else:
-        log(f'Set module version=v{ver} (versionCode fallback kept)')
+    if not replaced['version'] and PACK_VERSION:
+        out.append(f'version={PACK_VERSION}')
+    if not replaced['versionCode'] and PACK_VERSIONCODE is not None:
+        out.append(f'versionCode={PACK_VERSIONCODE}')
+    return ('\n'.join(out) + '\n').encode('utf-8')
 
 
 # ============================================================
@@ -254,8 +284,8 @@ def set_version(version):
 # ============================================================
 # The offline bundle pre-packages the OCI image layers for arm64 inside the
 # module zip so the device can install without network access. The build script
-# downloads the layers from ghcr.io during CI, places them under module/offline/,
-# and customize.sh detects and deploys them at install time.
+# downloads the layers from ghcr.io during CI to tmp/offline/ (gitignored),
+# copies them briefly into module/offline/ for zipping, then cleans both up.
 
 BAIHU_REPO = "engigu/baihu"
 BAIHU_TAG = "latest"
@@ -315,7 +345,7 @@ def fetch_oci_offline(offline_dir, mirror_url=None):
     """Download arm64 OCI manifest + config + all layers into offline_dir.
 
     Args:
-        offline_dir: Target directory under module/offline/.
+        offline_dir: Target directory (use tmp/offline/ — gitignored).
         mirror_url: OCI registry mirror URL (e.g. https://ghcr.nju.edu.cn).
             Defaults to https://ghcr.io.
 
@@ -429,8 +459,9 @@ def fetch_oci_offline(offline_dir, mirror_url=None):
     with open(os.path.join(offline_dir, '.image_digest'), 'w') as f:
         f.write(f"IMAGE_DIGEST={image_digest}\n")
 
-    # Write bundle.info (provenance metadata)
-    mod_ver = _get_module_version() or 'unknown'
+    # Write bundle.info (provenance metadata). Prefer the effective release
+    # version injected at pack time, falling back to the tracked file.
+    mod_ver = PACK_VERSION or _get_module_version() or 'unknown'
     with open(os.path.join(offline_dir, 'bundle.info'), 'w') as f:
         f.write(f"BAIHU_REPO={BAIHU_REPO}\n")
         f.write(f"BAIHU_TAG={BAIHU_TAG}\n")
@@ -450,23 +481,30 @@ def pack_offline_zip(mirror_url=None):
         mirror_url: OCI registry mirror URL for downloading layers.
             Defaults to https://ghcr.io.
 
-    1. Download OCI layers to module/offline/.
-    2. Pack the full module/ (including offline/).
-    3. Clean up module/offline/ so git is not polluted.
+    1. Download OCI layers to tmp/offline/ (gitignored).
+    2. Copy to module/offline/ for packing.
+    3. Pack the full module/ (including offline/).
+    4. Clean up both tmp/offline/ and module/offline/.
     """
-    # Clean any stale offline dir from a previous failed run
-    if os.path.exists(OFFLINE_DIR):
-        shutil.rmtree(OFFLINE_DIR)
+    # Clean any stale offline dirs from a previous failed run
+    for d in (OFFLINE_DIR, MODULE_OFFLINE_DIR):
+        if os.path.exists(d):
+            shutil.rmtree(d)
 
     fetch_oci_offline(OFFLINE_DIR, mirror_url=mirror_url)
+
+    # Briefly copy into module/ so pack_zip picks it up
+    shutil.copytree(OFFLINE_DIR, MODULE_OFFLINE_DIR)
 
     # Regenerate bin/baihu inside pack_zip (via combine_baihu) so the fragment
     # merge is always fresh. The extra_exclude set is deliberately empty here:
     # we WANT the offline/ dir to be included.
     pack_zip(output_path=OUTPUT_OFFLINE_ZIP, extra_exclude=set())
 
-    # Clean up — the offline data is inside the zip, no need to keep it on disk
-    shutil.rmtree(OFFLINE_DIR)
+    # Clean up — the offline data is inside the zip
+    for d in (OFFLINE_DIR, MODULE_OFFLINE_DIR):
+        if os.path.exists(d):
+            shutil.rmtree(d)
     log('Cleaned up module/offline/')
 
     offline_size = os.path.getsize(OUTPUT_OFFLINE_ZIP)
@@ -500,20 +538,16 @@ def main():
                         help='Mirror URL for offline bundle download (default: https://ghcr.io)')
     args = parser.parse_args()
 
-    # Version logic:
-    #   --version → explicit version (online or offline build)
-    #   --offline-bundle without --version → keep whatever is in module.prop
-    #   otherwise → set DEFAULT_VERSION (1.0.0)
+    # Version logic (compute-only; never mutates the tracked module/prop):
+    #   --version → explicit release version
+    #   --offline-bundle without --version → keep the repo default version line
+    #   otherwise → overlay the default release version (1.0.0)
     if args.version:
-        set_version(args.version)
+        resolve_release(args.version)
     elif args.offline_bundle:
-        pass  # preserve existing module.prop version
+        resolve_release(None)
     elif not (args.push_webui or args.webui_only):
-        # Default/local packaging: unless --version is given, the module always
-        # ships the default release version (1.0.0). This keeps a plain local
-        # `python scripts/build.py` reproducible and independent of whatever
-        # version a previous --version run may have written into module.prop.
-        set_version(DEFAULT_VERSION)
+        resolve_release(None)
 
     if args.push_webui:
         # Special fast path: rebuild webui and push live

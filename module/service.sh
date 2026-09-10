@@ -15,37 +15,12 @@ log() {
 
 log "=== Baihu service starting ==="
 
-# === Ensure baihu command is in system PATH ===
-# Magisk mounts the module's system/bin/ automatically via magic mount.
-# KernelSU 3.0+ requires a metamodule (e.g. meta-overlayfs) for system/
-# mounting.  If that hasn't happened, bind mount manually.
-if ! command -v baihu >/dev/null 2>&1; then
-  if [ -f "$MODDIR/bin/baihu" ]; then
-    log "baihu not in PATH, attempting bind mount..."
-    # Try /system/bin (Magisk, KernelSU with metamodule — OverlayFS
-    # makes /system writable).
-    if touch /system/bin/baihu 2>/dev/null; then
-      mount -o bind "$MODDIR/bin/baihu" /system/bin/baihu 2>/dev/null && \
-        log "bind mount /system/bin/baihu OK" || \
-        log "bind mount /system/bin/baihu failed"
-      chmod 0755 /system/bin/baihu 2>/dev/null || true
-    else
-      # /system is read-only (KernelSU without metamodule).
-      # /sbin is typically a writable tmpfs on KernelSU.
-      log "/system is read-only, trying /sbin..."
-      if touch /sbin/baihu 2>/dev/null; then
-        mount -o bind "$MODDIR/bin/baihu" /sbin/baihu 2>/dev/null && \
-          log "bind mount /sbin/baihu OK" || \
-          log "bind mount /sbin/baihu failed"
-        chmod 0755 /sbin/baihu 2>/dev/null || true
-      else
-        log "cannot bind mount baihu to any system path"
-      fi
-    fi
-  fi
-fi
+# Ensure baihu command is in system PATH (shared helper: magic mount on Magisk,
+# bind mount fallback on KernelSU).
+. "$MODDIR/boot-common.sh"
+ensure_baihu_path "$MODDIR"
 
-# Prevent suspend
+# Prevent suspend (released when the panel stops, see cmd_stop)
 echo "noSuspend" > /sys/power/wake_lock 2>/dev/null || true
 dumpsys deviceidle disable 2>/dev/null || true
 

@@ -1,38 +1,24 @@
 #!/system/bin/sh
 # Baihu Panel - post-fs-data
-# Ensures /data/baihu is in a clean state before module mounts
-# Also ensures baihu command is available in system PATH
+# Runs early (right after /data is mounted), cleans stale container mounts and
+# ensures the baihu command is on the system PATH.
 
 MODDIR=${0%/*}
 
 # Bundled commands first (modified ROMs may lack system tools)
-PATH=$MODDIR/bin:$PATH
-export PATH
+export PATH=$MODDIR/bin:/data/adb/ap/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH
 
 DATA_DIR=/data/baihu
 
-# Check for stale mounts from previous container (exact match)
+# Unmount any stale container mounts left from a previous session (exact match).
 if grep -q " $DATA_DIR " /proc/mounts 2>/dev/null; then
   umount -l "$DATA_DIR/rootfs" 2>/dev/null || true
   umount -l "$DATA_DIR" 2>/dev/null || true
 fi
 
-# === Ensure baihu command is in system PATH ===
-# Magisk mounts system/bin/ automatically via magic mount.
-# KernelSU 3.0+ requires a metamodule (e.g. meta-overlayfs) for module
-# system/ mounting.  If the framework hasn't (or won't) mount it, bind
-# mount the baihu script to a writable location in PATH manually.
-if [ -f "$MODDIR/bin/baihu" ] && [ ! -f /system/bin/baihu ] && [ ! -f /sbin/baihu ]; then
-  # Try /system/bin (Magisk, KernelSU with metamodule)
-  if touch /system/bin/baihu 2>/dev/null; then
-    mount -o bind "$MODDIR/bin/baihu" /system/bin/baihu 2>/dev/null || true
-  else
-    # /system is read-only (KernelSU without metamodule).
-    # /sbin is typically a writable tmpfs on KernelSU.
-    if [ -d /sbin ] && touch /sbin/baihu 2>/dev/null; then
-      mount -o bind "$MODDIR/bin/baihu" /sbin/baihu 2>/dev/null || true
-    fi
-  fi
-fi
+# Ensure baihu is on the system PATH (shared helper: magic mount on Magisk,
+# bind mount fallback on KernelSU).
+. "$MODDIR/boot-common.sh"
+ensure_baihu_path "$MODDIR"
 
 exit 0

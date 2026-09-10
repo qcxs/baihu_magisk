@@ -153,15 +153,15 @@ cmd_provision() {
   local src_envs="$ROOTFS/app/envs"
   local src_configs="$ROOTFS/app/configs"
 
-  # Copy example data if home dirs are empty
+  # Copy example data if home dirs are empty (use -Rafp for full metadata preservation)
   if [ -d "$src_data" ] && [ -z "$(ls -A "$HOME_DIR/data" 2>/dev/null)" ]; then
-    cp -r "$src_data"/* "$HOME_DIR/data/" 2>/dev/null || true
+    cp -Rafp "$src_data"/* "$HOME_DIR/data/" 2>/dev/null || true
   fi
   if [ -d "$src_envs" ] && [ -z "$(ls -A "$HOME_DIR/envs" 2>/dev/null)" ]; then
-    cp -r "$src_envs"/* "$HOME_DIR/envs/" 2>/dev/null || true
+    cp -Rafp "$src_envs"/* "$HOME_DIR/envs/" 2>/dev/null || true
   fi
   if [ -d "$src_configs" ] && [ -z "$(ls -A "$HOME_DIR/configs" 2>/dev/null)" ]; then
-    cp -r "$src_configs"/* "$HOME_DIR/configs/" 2>/dev/null || true
+    cp -Rafp "$src_configs"/* "$HOME_DIR/configs/" 2>/dev/null || true
   fi
 
   # Write resolv.conf
@@ -244,6 +244,9 @@ cmd_start() {
 cmd_stop() {
   need_bin rurima
   ui_print "停止白虎面板..."
+
+  # Release wake lock so the device can suspend normally
+  echo "" > /sys/power/wake_lock 2>/dev/null || true
 
   # Kill container process (pidof may list more than one PID)
   local pid
@@ -450,7 +453,10 @@ cmd_clean() {
   fi
 
   # Purge image cache; keep $HOME_DIR, $CONFIG_FILE and $SECRET_FILE.
-  rm -rf "$ROOTFS" "$LAYERS_DIR" 2>/dev/null || true
+  # Guard against empty paths so a misconfiguration can never expand to "/".
+  if [ -n "$ROOTFS" ] && [ -n "$LAYERS_DIR" ]; then
+    rm -rf "$ROOTFS" "$LAYERS_DIR" 2>/dev/null || true
+  fi
   rm -f "$DATA_DIR/.image_digest" "$DATA_DIR/.rootfs.meta" \
         "$MANIFEST_FILE" "$CONFIG_BLOB" "$LAYER_LIST" 2>/dev/null || true
 
